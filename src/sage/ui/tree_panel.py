@@ -19,7 +19,12 @@ class TreePanel(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings")
+        # Navigation keeps focus for keyboard expansion, but never selects an AI target.
+        style = ttk.Style(self)
+        style.map("Navigation.Treeview", background=[("selected", style.lookup("Treeview", "background"))],
+                  foreground=[("selected", style.lookup("Treeview", "foreground"))])
+        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings",
+                                 selectmode="none", style="Navigation.Treeview")
         self.tree.heading("#0", text="Name", anchor="w")
         headings = {
             "allocated": "Allocated",

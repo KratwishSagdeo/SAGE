@@ -60,6 +60,7 @@ class SageApplication(tk.Tk):
         self._volumes: dict[str, VolumeInfo] = {}
         self._clipboard_paths: list[str] = []
         self._clipboard_action = "copy"
+        self._action_frns: list[int] = []
         self._file_operation_running = False
         self._last_tree_refresh = 0.0
         self._pending_size_completion: ScanResult | None = None
@@ -133,6 +134,7 @@ class SageApplication(tk.Tk):
         self.tree_panel = TreePanel(left)
         self.tree_panel.grid(row=1, column=0, sticky="nsew")
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
+        self.tree_panel.tree.bind("<Button-1>", lambda _event: self._action_frns.clear(), add="+")
         self.tree_panel.tree.bind("<Double-1>", self._open_on_double_click)
         self.tree_panel.tree.bind("<Control-c>", self._copy_selection)
         self.tree_panel.tree.bind("<Control-x>", self._cut_selection)
@@ -179,6 +181,7 @@ class SageApplication(tk.Tk):
         generation = self._generation
         self._scan_started_at = time.monotonic()
         self._result = None
+        self._action_frns.clear()
         self._pending_size_completion = None
         self._assistant = EvidenceAssistant()
         self._conversation = ConversationAssistant()
@@ -314,6 +317,7 @@ class SageApplication(tk.Tk):
         self._mft_elapsed = time.monotonic() - self._scan_started_at
         self._size_started_at = time.monotonic()
         self._result = result
+        self._action_frns.clear()
         self._assistant.set_result(result)
         if self._assistant_busy:
             self._assistant_request_id += 1
@@ -369,13 +373,12 @@ class SageApplication(tk.Tk):
         self._assistant_request_id += 1
         request_id = self._assistant_request_id
         generation = self._generation
-        selected_paths = tuple(self._selected_paths())
         self.assistant_panel.begin_reply()
 
         def worker() -> None:
             try:
                 answer = conversation.answer(
-                    question, selected_paths,
+                    question,
                     on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                 )
@@ -392,7 +395,7 @@ class SageApplication(tk.Tk):
             return []
         paths = [
             result.path_for(frn)
-            for frn in self.tree_panel.selected_frns()
+            for frn in self._action_frns
             if frn != result.root_frn
         ]
         unique = list(dict.fromkeys(path for path in paths if path))
@@ -410,8 +413,7 @@ class SageApplication(tk.Tk):
         iid = self.tree_panel.tree.identify_row(event.y)
         if not iid:
             return
-        if iid not in self.tree_panel.tree.selection():
-            self.tree_panel.tree.selection_set(iid)
+        self._action_frns = [int(iid.split(":", 1)[1])] if iid.startswith("frn:") else []
         paths = self._selected_paths()
         selected = bool(paths) and not self._file_operation_running
         menu = self._tree_menu
@@ -419,6 +421,10 @@ class SageApplication(tk.Tk):
         menu.add_command(label="Open", command=self._open_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Show in Explorer", command=self._reveal_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Copy path", command=self._copy_path, state="normal" if selected else "disabled")
+        menu.add_command(label="Assess deletion / relocation", command=self._assess_selection,
+                         state="normal" if len(paths) == 1 and selected else "disabled")
+        menu.add_command(label="Windows Installed apps", command=lambda: self._open_settings("ms-settings:appsfeatures"))
+        menu.add_command(label="Windows Storage settings", command=lambda: self._open_settings("ms-settings:storagesense"))
         menu.add_separator()
         menu.add_command(label="Copy", command=self._copy_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Cut", command=self._cut_selection, state="normal" if selected else "disabled")
@@ -436,6 +442,18 @@ class SageApplication(tk.Tk):
         finally:
             menu.grab_release()
 
+    def _open_settings(self, uri: str) -> None:
+        try:
+            os.startfile(uri)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Could not open Windows Settings: {exc}")
+
+    def _assess_selection(self) -> None:
+        paths = self._selected_paths()
+        if len(paths) == 1 and not self._assistant_busy:
+            self.assistant_panel.write("You", f"Assess deletion / relocation: {paths[0]}")
+            self._answer(f'Is it safe to delete or relocate "{paths[0]}"?')
+
     def _open_on_double_click(self, event: tk.Event) -> None:
         iid = self.tree_panel.tree.identify_row(event.y)
         result = self._result
@@ -443,7 +461,7 @@ class SageApplication(tk.Tk):
             return
         record = result.records.get(int(iid.split(":", 1)[1]))
         if record and not record.is_directory:
-            self.tree_panel.tree.selection_set(iid)
+            self._action_frns = [record.frn]
             self._open_selection()
 
     def _open_selection(self) -> None:
@@ -486,7 +504,7 @@ class SageApplication(tk.Tk):
 
     def _paste_selection(self, _event: object = None) -> str:
         result = self._result
-        selected = self.tree_panel.selected_frns()
+        selected = self._action_frns
         if not self._clipboard_paths or result is None or len(selected) != 1:
             return "break"
         frn = selected[0]
@@ -530,11 +548,7 @@ class SageApplication(tk.Tk):
 
     def _recycle_selection(self, _event: object = None) -> str:
         paths = self._selected_paths()
-        if paths and messagebox.askyesno(
-            "Send to Recycle Bin",
-            f"Send {len(paths)} selected item(s) to the Recycle Bin?",
-            parent=self,
-        ):
+        if paths:
             self._run_file_operation("recycle", paths)
         return "break"
 
@@ -543,6 +557,22 @@ class SageApplication(tk.Tk):
     ) -> None:
         if self._file_operation_running or not paths:
             return
+        if action in {"move", "rename", "recycle"}:
+            from ..platform.windows.file_operations import validate_mutation
+            try:
+                assessments = validate_mutation(paths)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror(APP_NAME, str(exc))
+                return
+            preview = "\n\n".join(f"{path}\n{assessment['guidance']}" for path, assessment in zip(paths[:8], assessments[:8]))
+            if len(paths) > 8:
+                preview += f"\n\n…and {len(paths) - 8} additional items. Cancel to assess them individually."
+            if destination:
+                preview += f"\n\nDestination: {destination}"
+            if action == "recycle":
+                preview += "\n\nRecycling does not free drive space until the Recycle Bin is emptied. Windows may report that an item cannot be recycled; cancel rather than permanently deleting it."
+            if not messagebox.askyesno(APP_NAME, f"Confirm {action} of {len(paths)} item(s):\n\n{preview}", parent=self):
+                return
         if destination and action in {"copy", "move"}:
             target = os.path.normcase(os.path.abspath(destination))
             if any(
