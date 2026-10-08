@@ -10,6 +10,13 @@ import re
 from ..models import FileRecord, ScanResult
 from .evidence import format_bytes
 
+_WORD = re.compile(r"[\w.\-]+")
+
+
+def _name_key(name: str) -> str:
+    """Match 'Program Files (x86)' to the words 'program files x86'."""
+    return " ".join(_WORD.findall(name.casefold()))
+
 
 def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
     """Classify cleanup risk conservatively; never claim a path is safe to delete."""
@@ -42,43 +49,59 @@ class ScanEvidence:
         self.result = result
         self._folders: dict[str, list[int]] | None = None
         self._largest_cache: dict[tuple[str, int], tuple[int, ...]] = {}
+        self._summary: dict | None = None
+
+    _IGNORED = frozenset({
+        "a", "an", "and", "are", "can", "could", "delete", "do", "does", "drive", "file", "files", "folder",
+        "folders", "for", "from", "have", "how", "i", "in", "is", "it", "keep", "me", "move", "my", "of", "on",
+        "or", "please", "remove", "should", "that", "the", "this", "to", "what", "which", "would", "you",
+        "about", "big", "details", "give", "information", "large", "largest", "biggest", "list", "much",
+        "overview", "show", "size", "space", "storage", "tell", "use", "used", "uses", "using", "taking",
+        "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its", "safe", "free", "clear",
+        "clean", "cleanup", "junk", "inside", "contains", "contain", "why", "where", "there", "here", "c", "d",
+    })
 
     def _folder_index(self) -> dict[str, list[int]]:
         if self._folders is None:
             self._folders = {}
             for record in self.result.records.values():
                 if record.is_directory and record.frn != self.result.root_frn:
-                    self._folders.setdefault(record.name.casefold(), []).append(record.frn)
+                    self._folders.setdefault(_name_key(record.name), []).append(record.frn)
         return self._folders
+
+    def named_folders(self, question: str, limit: int = 6) -> list[int]:
+        """Folders named exactly in the question; longest names win over their sub-phrases."""
+        words = _WORD.findall(question.casefold())
+        index = self._folder_index()
+        found: list[int] = []
+        quoted = [value for groups in re.findall(r'"([^"\n]+)"|`([^`\n]+)`|(?<!\w)\x27([^\x27\n]+)\x27', question) for value in groups if value]
+        for name in quoted:
+            for frn in index.get(_name_key(name), ()):
+                if frn not in found and len(found) < limit:
+                    found.append(frn)
+        used: set[int] = set()
+        for width in range(min(5, len(words)), 0, -1):
+            for start in range(len(words) - width + 1):
+                span = range(start, start + width)
+                if len(found) >= limit:
+                    return found
+                if used.intersection(span):
+                    continue
+                phrase = " ".join(words[start:start + width]).rstrip(".")
+                if width == 1 and phrase in self._IGNORED:
+                    continue
+                matches = [frn for frn in index.get(phrase, ()) if frn not in found]
+                if matches:
+                    used.update(span)
+                    found.extend(matches[: limit - len(found)])
+        return found
 
     def mentioned(self, question: str, limit: int = 6) -> dict:
         """Resolve names such as Git before asking the model to interpret them."""
-        words = re.findall(r"[\w.\-]+", question.casefold())
-        ignored = {"a", "an", "and", "are", "can", "could", "delete", "do", "does", "drive", "file", "files", "folder", "folders", "for", "from", "have", "how", "i", "in", "is", "it", "keep", "me", "move", "my", "of", "on", "or", "please", "remove", "should", "that", "the", "this", "to", "what", "which", "would", "you"}
-        ignored.update({"about", "big", "details", "give", "information", "large", "largest", "biggest", "list", "much", "overview", "show", "size", "space", "storage", "tell", "use", "used", "uses", "using", "taking", "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its"})
-        index = self._folder_index()
-        found: list[int] = []
+        words = _WORD.findall(question.casefold())
         quoted = [value.casefold() for groups in re.findall(r'"([^"\n]+)"|`([^`\n]+)`|(?<!\w)\x27([^\x27\n]+)\x27', question) for value in groups if value]
-        for name in quoted:
-            for frn in index.get(name, ()):
-                if frn not in found and len(found) < limit:
-                    found.append(frn)
-        for width in range(min(5, len(words)), 0, -1):
-            if len(found) >= limit:
-                break
-            for start in range(len(words) - width + 1):
-                phrase = " ".join(words[start:start + width]).rstrip(".")
-                if width == 1 and phrase in ignored:
-                    continue
-                for frn in index.get(phrase, ()):
-                    if frn not in found:
-                        found.append(frn)
-                        if len(found) >= limit:
-                            break
-                if len(found) >= limit:
-                    break
-            if len(found) >= limit:
-                break
+        found = self.named_folders(question, limit)
+        ignored = self._IGNORED
         terms = list(dict.fromkeys(quoted + [word.rstrip(".") for word in words if word not in ignored and len(word.rstrip(".")) >= 2]))[:4]
         if not found and terms:
             exact: list[int] = []
@@ -91,6 +114,64 @@ class ScanEvidence:
                     partial.append(record.frn)
             found = (exact + partial)[:limit]
         return {"items": [self._entry(self.result.records[frn]) for frn in found], "searched_terms": terms}
+
+    def _allocated(self, record: FileRecord) -> int:
+        if record.is_directory:
+            return self.result.directory_sizes.get(record.frn, (0, 0))[1]
+        return record.allocated_size
+
+    def largest_children(self, frn: int, limit: int = 8) -> list[str]:
+        """'path — size' lines for a folder's biggest direct children."""
+        result = self.result
+        children = [result.records[c] for c in result.children.get(frn, ()) if c in result.records]
+        biggest = heapq.nlargest(limit, children, key=self._allocated)
+        return [
+            f"{result.path_for(child.frn)} ({'folder' if child.is_directory else 'file'}) — {format_bytes(self._allocated(child))}"
+            for child in biggest
+        ]
+
+    def drive_summary(self) -> dict:
+        """Compact whole-drive picture sent with every model request."""
+        if self._summary is None:
+            result = self.result
+            items, files, folders = result.root_stats
+            logical, allocated = result.directory_sizes.get(result.root_frn, (0, 0))
+            summary = {
+                "drive": result.volume.display_name,
+                "used": format_bytes(allocated) if result.sizes_complete else "pending",
+                "files": files,
+                "folders": folders,
+                "top_level_by_size": self.largest_children(result.root_frn, 12),
+            }
+            if result.sizes_complete:
+                summary["largest_files"] = [
+                    f"{entry['path']} — {entry['allocated_display']}"
+                    for entry in self.largest("files", 10)["items"]
+                ]
+                deep = heapq.nlargest(
+                    40,
+                    (r for r in result.records.values() if r.is_directory and r.frn != result.root_frn),
+                    key=self._allocated,
+                )
+                leaves = [r for r in deep if not any(
+                    other is not r and self._is_ancestor(r.frn, other.frn) for other in deep
+                )]
+                summary["biggest_leaf_folders"] = [
+                    f"{result.path_for(r.frn)} — {format_bytes(self._allocated(r))}" for r in leaves[:10]
+                ]
+            self._summary = summary
+        return self._summary
+
+    def _is_ancestor(self, ancestor: int, frn: int) -> bool:
+        records = self.result.records
+        current = records[frn].parent_frn
+        for _ in range(64):
+            if current == ancestor:
+                return True
+            if current == self.result.root_frn or current not in records:
+                return False
+            current = records[current].parent_frn
+        return False
 
     def overview(self) -> dict:
         result = self.result
@@ -119,6 +200,7 @@ class ScanEvidence:
         )
         ready = result.sizes_complete if record.is_directory else record.size_ready and not record.size_error
         return {
+            "frn": record.frn,
             "path": path,
             "kind": "folder" if record.is_directory else "file",
             "logical_bytes": logical if ready else None,
@@ -172,11 +254,13 @@ class ScanEvidence:
         if requested == ntpath.normcase(result.volume.drive + "\\"):
             logical, allocated = result.directory_sizes.get(result.root_frn, (0, 0))
             return {"path": path, "kind": "drive", "logical_bytes": logical if result.sizes_complete else None, "allocated_bytes": allocated if result.sizes_complete else None, "logical_display": format_bytes(logical) if result.sizes_complete else "pending", "allocated_display": format_bytes(allocated) if result.sizes_complete else "pending", "cleanup_risk": assess_path(path)}
-        name = ntpath.basename(requested)
-        for record in result.records.values():
-            if record.name.casefold() != name.casefold():
-                continue
-            actual = result.path_for(record.frn)
-            if actual and ntpath.normcase(actual) == requested:
-                return self._entry(record)
-        return {"error": "Path was not found in the current scan.", "path": path}
+        current = result.root_frn
+        for part in requested[len(result.volume.drive) + 1:].split("\\"):
+            current = next(
+                (frn for frn in result.children.get(current, ())
+                 if frn in result.records and ntpath.normcase(result.records[frn].name) == part),
+                None,
+            )
+            if current is None:
+                return {"error": "Path was not found in the current scan.", "path": path}
+        return self._entry(result.records[current])

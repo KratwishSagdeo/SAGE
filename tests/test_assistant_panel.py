@@ -29,7 +29,8 @@ class AssistantPanelTests(unittest.TestCase):
         except tk.TclError as exc:
             self.skipTest(f"Tk unavailable: {exc}")
         self.root.withdraw()
-        self.panel = AssistantPanel(self.root, lambda _question: None)
+        self.asked = []
+        self.panel = AssistantPanel(self.root, lambda question, quote: self.asked.append((question, quote)))
 
     def tearDown(self):
         if hasattr(self, "root"):
@@ -52,6 +53,28 @@ class AssistantPanelTests(unittest.TestCase):
         self.assertTrue(self.panel.transcript.tag_ranges("bold"))
         self.assertEqual(str(self.panel.ask_button["state"]), "normal")
         self.assertFalse(self.panel._busy)
+
+    def test_cleanup_rows_have_working_delete_buttons(self):
+        from sage.services.cleanup import CleanupSuggestion
+        item = CleanupSuggestion("C:\\Windows\\Temp", "Windows temporary files", "Leftovers.", 2 * 1024**3)
+        clicked = []
+        self.panel.add_cleanup_actions([item], clicked.append)
+        text = self.panel.transcript.get("1.0", "end-1c")
+        self.assertIn("2.0 GB  C:\\Windows\\Temp", text)
+        buttons = [self.panel.transcript.nametowidget(name) for name in self.panel.transcript.window_names()]
+        self.assertEqual(buttons[0]["text"], "Delete contents permanently")
+        buttons[0].invoke()
+        self.assertEqual(clicked, [item])
+
+    def test_selected_chat_text_is_sent_with_the_next_question(self):
+        self.panel.write("SAGE", "C:\\Windows\\Temp holds 2 GB.")
+        start = self.panel.transcript.search("C:\\Windows\\Temp", "1.0")
+        self.panel.transcript.tag_add("sel", start, f"{start} lineend")
+        self.panel._capture_selection()
+        self.panel.question.insert(0, "is this safe?")
+        self.panel._submit()
+        self.assertEqual(self.asked, [("is this safe?", "C:\\Windows\\Temp holds 2 GB.")])
+        self.assertEqual(self.panel._quote, "")
 
 
 class AssistantEventTests(unittest.TestCase):

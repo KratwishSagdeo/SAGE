@@ -102,7 +102,7 @@ class ConversationTests(unittest.TestCase):
         with patch("sage.services.local_ai.urllib.request.build_opener") as opener:
             opener.return_value.open.side_effect = TimeoutError("timed out")
             assistant = ConversationAssistant(sample_scan())
-            answer = assistant.answer("What should I delete?")
+            answer = assistant.answer("Is the archive worth keeping?")
         self.assertIn("did not finish within 180 seconds", answer)
         self.assertNotIn("No external AI service is connected", answer)
         self.assertIn("cannot determine which files you should delete", answer)
@@ -138,6 +138,7 @@ class ConversationTests(unittest.TestCase):
     def test_named_git_folder_is_grounded_before_first_model_call(self):
         result = sample_scan()
         result.records[30] = FileRecord(30, 5, "Git", FILE_ATTRIBUTE_DIRECTORY)
+        result.children[5].append(30)
         payloads = []
         def fake(payload):
             payloads.append(payload)

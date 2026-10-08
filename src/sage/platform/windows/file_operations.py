@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
+import stat
+import sys
 from ctypes import wintypes
 
 FO_MOVE = 0x0001
@@ -13,6 +16,8 @@ FO_RENAME = 0x0004
 FOF_ALLOWUNDO = 0x0040
 FOF_WANTNUKEWARNING = 0x4000
 COINIT_APARTMENTTHREADED = 0x2
+SHERB_SILENT = 0x0007
+E_UNEXPECTED = -2147418113
 
 
 class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -77,4 +82,54 @@ def shell_file_operation(
     finally:
         if initialized:
             ole32.CoUninitialize()
+
+
+def delete_permanently(path: str, contents_only: bool = False) -> int:
+    """Delete without the Recycle Bin; return how many items could not be removed.
+
+    Files in use are skipped. Symlinks and junctions are removed, never followed.
+    """
+    absolute = os.path.abspath(path)
+    if not os.path.isabs(path) or not os.path.splitdrive(absolute)[1].strip("\\/"):
+        raise ValueError("Refusing to delete a drive root or relative path.")
+    failures: list[str] = []
+
+    def retry_writable(func, failed: str, _error: object) -> None:
+        try:
+            os.chmod(failed, stat.S_IWRITE)
+            func(failed)
+        except OSError:
+            failures.append(failed)
+
+    handler = {"onexc": retry_writable} if sys.version_info >= (3, 12) else {"onerror": retry_writable}
+    targets = [entry.path for entry in os.scandir(absolute)] if contents_only else [absolute]
+    for target in targets:
+        try:
+            info = os.lstat(target)
+            is_link = stat.S_ISLNK(info.st_mode) or bool(
+                getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+            if is_link:
+                try:
+                    os.unlink(target)
+                except OSError:
+                    os.rmdir(target)
+            elif stat.S_ISDIR(info.st_mode):
+                shutil.rmtree(target, **handler)
+            else:
+                retry_writable(os.unlink, target, None)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failures.append(target)
+    return len(failures)
+
+
+def empty_recycle_bin(drive: str) -> None:
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.SHEmptyRecycleBinW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.DWORD]
+    shell32.SHEmptyRecycleBinW.restype = ctypes.c_long
+    code = shell32.SHEmptyRecycleBinW(None, drive.rstrip("\\/") + "\\", SHERB_SILENT)
+    if code < 0 and code != E_UNEXPECTED:  # E_UNEXPECTED: the bin was already empty.
+        raise OSError(code, f"Could not empty the Recycle Bin (HRESULT {code & 0xFFFFFFFF:#x}).")
 

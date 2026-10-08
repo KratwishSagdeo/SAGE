@@ -8,14 +8,16 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .. import __version__
 from ..config import APP_NAME, APP_SUBTITLE, MIN_WINDOW_SIZE, WINDOW_SIZE
 from ..models import ScanResult, VolumeInfo
 from ..platform.windows.drives import list_ntfs_volumes
-from ..platform.windows.file_operations import shell_file_operation
-from ..services.evidence import EvidenceAssistant
+from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
+from ..services.cleanup import CleanupSuggestion, cleanup_report
+from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import ConversationAssistant, OllamaClient
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
@@ -282,6 +284,8 @@ class SageApplication(tk.Tk):
                 elif kind == "assistant_answer":
                     self._assistant_busy = False
                     self.assistant_panel.finish_reply(event[3])
+                    if len(event) > 4 and event[4]:
+                        self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -323,13 +327,16 @@ class SageApplication(tk.Tk):
         self.tree_panel.show_result(result)
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
+        self.scan_button.configure(text="Scan MFT")
+        if result.sizes_complete:
+            self._size_finished(result)
+            return
         self.progress_bar.configure(mode="determinate", value=0)
         self.progress_phase.set("Measuring file sizes")
         self.progress_detail.set("0%")
         self.status_var.set(
             f"MFT tree ready in {self._mft_elapsed:.1f}s — measuring file sizes…"
         )
-        self.scan_button.configure(text="Scan MFT")
         threading.Thread(
             target=self._size_worker,
             args=(self._generation, result, self._size_cancel),
@@ -344,6 +351,9 @@ class SageApplication(tk.Tk):
         self.progress_phase.set("Drive scan complete")
         self.progress_detail.set("100%")
         self.assistant_panel.write("SAGE", self._assistant.size_summary())
+        suggestions = self._conversation.cleanup_suggestions()
+        self.assistant_panel.write("SAGE", cleanup_report(result, suggestions))
+        self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
         self.status_var.set(
             f"Ready — MFT {self._mft_elapsed:.1f}s, "
             f"sizes {time.monotonic() - self._size_started_at:.1f}s, "
@@ -361,7 +371,7 @@ class SageApplication(tk.Tk):
         self.assistant_panel.write("SAGE", f"{phase} failed:\n{exc}")
         messagebox.showerror(APP_NAME, f"{phase} failed.\n\n{exc}")
 
-    def _answer(self, question: str) -> str | None:
+    def _answer(self, question: str, quoted: str = "") -> str | None:
         conversation = self._conversation
         if self._assistant_busy:
             return "I am still answering the previous question. Please try again shortly."
@@ -373,15 +383,17 @@ class SageApplication(tk.Tk):
         self.assistant_panel.begin_reply()
 
         def worker() -> None:
+            suggestions: list[CleanupSuggestion] = []
             try:
                 answer = conversation.answer(
-                    question, selected_paths,
+                    question, selected_paths, quoted=quoted,
                     on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                 )
+                suggestions = list(conversation.last_suggestions)
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer))
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None
@@ -538,8 +550,38 @@ class SageApplication(tk.Tk):
             self._run_file_operation("recycle", paths)
         return "break"
 
+    def _delete_suggestion(self, suggestion: CleanupSuggestion) -> None:
+        result = self._result
+        if result is None or self._file_operation_running:
+            return
+        if not any(s.path == suggestion.path for s in self._conversation.cleanup_suggestions()):
+            messagebox.showinfo(APP_NAME, "That item is not in the current scan's cleanup list. Scan again for fresh suggestions.")
+            return
+        size = format_bytes(suggestion.allocated)
+        if suggestion.action == "empty_recycle_bin":
+            prompt = f"Empty the Recycle Bin on {result.volume.drive} ({size})?\n\nThis cannot be undone."
+        else:
+            target = "everything inside" if suggestion.contents_only else ""
+            prompt = (
+                f"Permanently delete {target}\n{suggestion.path}\n({size})?\n\n{suggestion.reason}\n\n"
+                "This skips the Recycle Bin and cannot be undone. Files in use are skipped."
+            )
+
+        def operation() -> bool:
+            if suggestion.action == "empty_recycle_bin":
+                empty_recycle_bin(result.volume.drive)
+                return True
+            return delete_permanently(suggestion.path, suggestion.contents_only) == 0
+
+        if messagebox.askyesno("Delete permanently", prompt, icon="warning", parent=self):
+            self._run_file_operation("permanent delete", [suggestion.path], operation=operation)
+
     def _run_file_operation(
-        self, action: str, paths: list[str], destination: str | None = None
+        self,
+        action: str,
+        paths: list[str],
+        destination: str | None = None,
+        operation: Callable[[], bool] | None = None,
     ) -> None:
         if self._file_operation_running or not paths:
             return
@@ -576,7 +618,7 @@ class SageApplication(tk.Tk):
 
         def worker() -> None:
             try:
-                completed = shell_file_operation(action, paths, destination, owner_hwnd)
+                completed = operation() if operation else shell_file_operation(action, paths, destination, owner_hwnd)
                 self._events.put(("operation_done", generation, action, completed, requires_rescan))
             except Exception as exc:
                 self._events.put(("operation_error", generation, exc, requires_rescan))
@@ -593,7 +635,10 @@ class SageApplication(tk.Tk):
         self.progress_detail.set("Ready")
         if action == "move":
             self._clipboard_paths = []
-        outcome = "completed" if completed else "cancelled or only partly completed"
+        outcome = "completed" if completed else (
+            "finished, but some files were in use and were skipped"
+            if action == "permanent delete" else "cancelled or only partly completed"
+        )
         if requires_rescan:
             self._pending_size_completion = None
             self.assistant_panel.write("SAGE", f"File operation {outcome}: {action}. Refreshing the drive tree.")

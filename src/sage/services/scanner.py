@@ -28,7 +28,12 @@ def scan_ntfs(
     stage = getattr(progress, "on_stage", None)
     if stage:
         stage("Building MFT hierarchy")
-    return build_scan_result(volume, records, skipped)
+    result = build_scan_result(volume, records, skipped)
+    files = [record for record in result.records.values() if not record.is_directory]
+    if all(record.size_ready for record in files):
+        calculate_directory_sizes(result)
+        result.sized_files = len(files)
+    return result
 
 
 def analyze_sizes(
@@ -36,7 +41,14 @@ def analyze_sizes(
     progress: Callable[[int, int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    """Run the deliberately separate, cancellable slow phase."""
+    """Aggregate folder totals; walk directories only when MFT sizes are missing."""
+    files = [record for record in result.records.values() if not record.is_directory]
+    if not files or all(record.size_ready for record in files):
+        result.sized_files = len(files)
+        calculate_directory_sizes(result)
+        if progress:
+            progress(len(files), len(files), result.size_errors)
+        return
     collect_file_sizes(result, progress, cancelled)
     if cancelled and cancelled():
         raise InterruptedError("Size analysis cancelled.")

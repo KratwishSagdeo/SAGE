@@ -6,11 +6,13 @@ import tkinter as tk
 import time
 from collections.abc import Callable
 from tkinter import ttk
+
+from ..services.evidence import format_bytes
 from .markdown import markdown_spans
 
 
 class AssistantPanel(ttk.Frame):
-    def __init__(self, parent: tk.Misc, on_question: Callable[[str], str | None]) -> None:
+    def __init__(self, parent: tk.Misc, on_question: Callable[[str, str], str | None]) -> None:
         super().__init__(parent, padding=10)
         self.on_question = on_question
         self._busy = False
@@ -36,8 +38,11 @@ class AssistantPanel(ttk.Frame):
             padx=12,
             pady=12,
             font=("Segoe UI", 10),
+            exportselection=False,
         )
         self.transcript.grid(row=1, column=0, sticky="nsew")
+        self.transcript.bind("<<Selection>>", self._capture_selection)
+        self._quote = ""
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.transcript.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.transcript.configure(yscrollcommand=scrollbar.set)
@@ -53,8 +58,15 @@ class AssistantPanel(ttk.Frame):
         self.activity_text = tk.StringVar(value="Ready")
         ttk.Label(self.activity, textvariable=self.activity_text).pack(side="left")
 
+        self.quote_bar = ttk.Frame(self)
+        self.quote_bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.quote_text = tk.StringVar()
+        ttk.Label(self.quote_bar, textvariable=self.quote_text, style="Status.TLabel").pack(side="left", fill="x", expand=True)
+        ttk.Button(self.quote_bar, text="✕", width=3, command=self.clear_quote).pack(side="right")
+        self.quote_bar.grid_remove()
+
         composer = ttk.Frame(self)
-        composer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        composer.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         composer.columnconfigure(0, weight=1)
         self.question = ttk.Entry(composer)
         self.question.grid(row=0, column=0, sticky="ew", padx=(0, 7))
@@ -75,6 +87,38 @@ class AssistantPanel(ttk.Frame):
         self.transcript.insert("end", f"{speaker}\n", ("speaker",))
         for text, tags in markdown_spans(message) if speaker == "SAGE" else [(message, ())]:
             self.transcript.insert("end", text, tags)
+        self.transcript.see("end")
+        self.transcript.configure(state="disabled")
+
+    def _capture_selection(self, _event: object = None) -> None:
+        ranges = self.transcript.tag_ranges("sel")
+        text = self.transcript.get(ranges[0], ranges[1]).strip() if ranges else ""
+        if text:
+            self._quote = text[:2000]
+            preview = " ".join(text.split())
+            self.quote_text.set(f"Asking about: “{preview[:90]}{'…' if len(preview) > 90 else ''}”")
+            self.quote_bar.grid()
+
+    def clear_quote(self) -> None:
+        self._quote = ""
+        self.quote_bar.grid_remove()
+
+    def add_cleanup_actions(self, suggestions: list, on_delete: Callable) -> None:
+        """List verified cleanup items, each with its own delete button."""
+        if not suggestions:
+            return
+        self.transcript.configure(state="normal")
+        for index, suggestion in enumerate(suggestions, 1):
+            self.transcript.insert("end", f"\n\n{index}. ")
+            self.transcript.insert("end", format_bytes(suggestion.allocated), ("bold",))
+            self.transcript.insert("end", "  ")
+            self.transcript.insert("end", suggestion.path, ("code",))
+            self.transcript.insert("end", f"\n{suggestion.title}. {suggestion.reason}\n")
+            label = "Empty Recycle Bin" if suggestion.action == "empty_recycle_bin" else (
+                "Delete contents permanently" if suggestion.contents_only else "Delete permanently"
+            )
+            button = ttk.Button(self.transcript, text=label, command=lambda item=suggestion: on_delete(item))
+            self.transcript.window_create("end", window=button, pady=2)
         self.transcript.see("end")
         self.transcript.configure(state="disabled")
 
@@ -151,9 +195,15 @@ class AssistantPanel(ttk.Frame):
         if not question or self._busy:
             return
         self.question.delete(0, "end")
-        self.write("You", question)
+        quote = self._quote
+        self.clear_quote()
+        if quote:
+            preview = " ".join(quote.split())
+            self.write("You", f"“{preview[:200]}{'…' if len(preview) > 200 else ''}”\n{question}")
+        else:
+            self.write("You", question)
         try:
-            answer = self.on_question(question)
+            answer = self.on_question(question, quote)
         except RuntimeError as exc:
             answer = str(exc)
         if answer is not None:

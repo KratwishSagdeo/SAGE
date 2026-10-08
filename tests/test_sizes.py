@@ -11,6 +11,7 @@ from sage.platform.windows.sizes import (
     collect_file_sizes,
 )
 from sage.services.hierarchy import build_scan_result
+from sage.services.scanner import analyze_sizes, scan_ntfs
 
 
 class SizeCollectionTests(unittest.TestCase):
@@ -63,6 +64,38 @@ class SizeCollectionTests(unittest.TestCase):
         struct.pack_into("<Q", buffer, FILE_ID_BOTH_DIR_INFO_HEADER.FileId.offset, 11)
         buffer[size:size + 2] = "a".encode("utf-16-le")
         self.assertEqual(_directory_entries(buffer), [(11, 5, 8)])
+
+    def test_analyze_sizes_skips_directory_walk_when_mft_already_sized(self):
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY, size_ready=True),
+            11: FileRecord(11, 5, "a.bin", 0, 5, 8, size_ready=True),
+        }
+        result = build_scan_result(VolumeInfo("E:", "Data", "NTFS"), records)
+        with patch("sage.services.scanner.collect_file_sizes") as collect:
+            analyze_sizes(result)
+        collect.assert_not_called()
+        self.assertTrue(result.sizes_complete)
+        self.assertEqual(result.directory_sizes[5], (5, 8))
+        self.assertEqual(result.sized_files, 1)
+
+    def test_scan_ntfs_completes_sizes_from_mft_records(self):
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY, size_ready=True),
+            11: FileRecord(11, 5, "a.bin", 0, 5, 8, size_ready=True),
+        }
+
+        def fake_enumerate(_drive, progress, cancelled):
+            if progress:
+                progress(1)
+            return records, 0
+
+        with patch(
+            "sage.services.scanner.get_volume_info",
+            return_value=VolumeInfo("E:", "Data", "NTFS"),
+        ), patch("sage.services.scanner.enumerate_mft", side_effect=fake_enumerate):
+            result = scan_ntfs("E:")
+        self.assertTrue(result.sizes_complete)
+        self.assertEqual(result.directory_sizes[5], (5, 8))
 
 
 if __name__ == "__main__":
