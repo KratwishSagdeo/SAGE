@@ -288,6 +288,7 @@ class SageApplication(tk.Tk):
                     self.assistant_panel.finish_reply(event[3])
                     if len(event) > 4 and event[4]:
                         self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
+                        self._conversation.remember_suggestions(event[4])
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -353,9 +354,11 @@ class SageApplication(tk.Tk):
         self.progress_phase.set("Drive scan complete")
         self.progress_detail.set("100%")
         self.assistant_panel.write("SAGE", self._assistant.size_summary())
-        suggestions = self._conversation.cleanup_suggestions()
-        self.assistant_panel.write("SAGE", cleanup_report(result, suggestions))
-        self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
+        if result.volume.drive.upper() == "C:":
+            suggestions = self._conversation.cleanup_suggestions()
+            self.assistant_panel.write("SAGE", cleanup_report(result, suggestions))
+            self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
+            self._conversation.remember_suggestions(suggestions)
         self.status_var.set(
             f"Ready â€” MFT {self._mft_elapsed:.1f}s, "
             f"sizes {time.monotonic() - self._size_started_at:.1f}s, "
