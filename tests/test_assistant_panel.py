@@ -71,7 +71,7 @@ class AssistantPanelTests(unittest.TestCase):
         start = self.panel.transcript.search("C:\\Windows\\Temp", "1.0")
         self.panel.transcript.tag_add("sel", start, f"{start} lineend")
         self.panel._capture_selection()
-        self.panel.question.insert(0, "is this safe?")
+        self.panel.question.insert("1.0", "is this safe?")
         self.panel._submit()
         self.assertEqual(self.asked, [("is this safe?", "C:\\Windows\\Temp holds 2 GB.")])
         self.assertEqual(self.panel._quote, "")

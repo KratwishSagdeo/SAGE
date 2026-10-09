@@ -1,6 +1,6 @@
 """Application-wide constants kept separate from behavior."""
 
-APP_NAME = "SAGE"
+APP_NAME = "SAGE AI"
 APP_SUBTITLE = "Storage Analysis and Guidance Engine"
 WINDOW_SIZE = "1440x860"
 MIN_WINDOW_SIZE = (1050, 650)

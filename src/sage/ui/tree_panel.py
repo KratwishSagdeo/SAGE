@@ -15,6 +15,7 @@ class TreePanel(ttk.Frame):
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, style="Surface.TFrame")
         self.result: ScanResult | None = None
+        self._sort_mode = "name_asc"
         self.folder_icon, self.file_icon, self.drive_icon = self._make_icons()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -115,17 +116,90 @@ class TreePanel(ttk.Frame):
                 self.tree.item(iid, values=self._values(record))
             pending.extend(self.tree.get_children(iid))
 
+    # ── Sorting ───────────────────────────────────────────────────────
+
+    def apply_sort(self, mode: str) -> None:
+        """Change sort mode and re-sort all currently loaded tree items."""
+        self._sort_mode = mode
+        if self.result is None:
+            return
+        for root_iid in self.tree.get_children(""):
+            self._resort_subtree(root_iid)
+
+    def _sort_children(self, child_frns: list[int]) -> list[int]:
+        """Sort a list of child FRNs according to the current sort mode.
+
+        Folders always appear before files.  Missing size values are
+        treated as 0 so that sorting never crashes.
+        """
+        if self.result is None:
+            return child_frns
+
+        records = self.result.records
+        dir_sizes = self.result.directory_sizes
+        mode = self._sort_mode
+
+        folders: list[int] = []
+        files: list[int] = []
+        for frn in child_frns:
+            r = records.get(frn)
+            if r is None:
+                continue
+            (folders if r.is_directory else files).append(frn)
+
+        reverse = mode.endswith("_desc")
+
+        def _key(frn: int) -> tuple:
+            r = records[frn]
+            if mode.startswith("name"):
+                return (r.name.casefold(),)
+            if mode.startswith("logical"):
+                size = dir_sizes.get(r.frn, (0, 0))[0] if r.is_directory else r.logical_size
+                # Secondary sort by name for stability
+                return (size, r.name.casefold())
+            if mode.startswith("allocated"):
+                size = dir_sizes.get(r.frn, (0, 0))[1] if r.is_directory else r.allocated_size
+                return (size, r.name.casefold())
+            return (r.name.casefold(),)
+
+        folders.sort(key=_key, reverse=reverse)
+        files.sort(key=_key, reverse=reverse)
+        return folders + files
+
+    def _resort_subtree(self, parent_iid: str) -> None:
+        """Re-order loaded children of *parent_iid* using tree.move()."""
+        children = list(self.tree.get_children(parent_iid))
+        if not children:
+            return
+
+        frn_items: list[tuple[str, int]] = []
+        for iid in children:
+            if iid.startswith("frn:"):
+                frn_items.append((iid, int(iid.split(":", 1)[1])))
+
+        if not frn_items:
+            return
+
+        sorted_frns = self._sort_children([frn for _, frn in frn_items])
+        frn_to_iid = {frn: iid for iid, frn in frn_items}
+
+        for index, frn in enumerate(sorted_frns):
+            iid = frn_to_iid.get(frn)
+            if iid:
+                self.tree.move(iid, parent_iid, index)
+
+        # Recurse into expanded children only
+        for iid in self.tree.get_children(parent_iid):
+            if iid.startswith("frn:") and self.tree.item(iid, "open"):
+                self._resort_subtree(iid)
+
+    # ── Internal ──────────────────────────────────────────────────────
+
     def _insert_children(self, parent_frn: int) -> None:
         if self.result is None:
             return
         parent_iid = self._iid(parent_frn)
-        child_ids = sorted(
-            self.result.children.get(parent_frn, ()),
-            key=lambda frn: (
-                not self.result.records[frn].is_directory,
-                self.result.records[frn].name.casefold(),
-            ),
-        )
+        child_ids = self._sort_children(list(self.result.children.get(parent_frn, ())))
         for child_frn in child_ids:
             child = self.result.records.get(child_frn)
             if child is None:
@@ -158,7 +232,7 @@ class TreePanel(ttk.Frame):
     def _values(self, record: FileRecord) -> tuple[str, ...]:
         result = self.result
         if result is None:
-            return ("—",) * len(self.COLUMNS)
+            return ("\u2014",) * len(self.COLUMNS)
         if record.is_directory:
             items, files, folders = result.stats.get(record.frn, (0, 0, 0))
             logical, allocated = result.directory_sizes.get(record.frn, (0, 0))
@@ -174,14 +248,14 @@ class TreePanel(ttk.Frame):
                 allocated_text = format_bytes(allocated) + "+"
                 logical_text = format_bytes(logical) + "+"
             else:
-                allocated_text = logical_text = "Pending…"
+                allocated_text = logical_text = "Pending\u2026"
         elif record.size_error:
             allocated_text = logical_text = "Unavailable"
         elif record.size_ready:
             allocated_text = format_bytes(allocated)
             logical_text = format_bytes(logical)
         else:
-            allocated_text = logical_text = "Pending…"
+            allocated_text = logical_text = "Pending\u2026"
         return (
             allocated_text,
             logical_text,

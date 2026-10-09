@@ -64,6 +64,9 @@ def configure_styles(style: ttk.Style) -> None:
     style.configure("SurfaceMuted.TLabel", background=SURFACE, foreground=TEXT_SECONDARY, font=FONT_SMALL)
     style.configure("Quote.TLabel", background=QUOTE_BG, foreground=TEXT, font=FONT_SMALL)
     style.configure("Status.TLabel", background=BG, foreground=TEXT_SECONDARY, font=FONT_SMALL, padding=(2, 4))
+    style.configure("HeaderInfo.TLabel", background=SURFACE, foreground=TEXT_SECONDARY, font=FONT_SMALL)
+    style.configure("Hint.TLabel", background=SURFACE, foreground=TEXT_SECONDARY, font=("Segoe UI", 8))
+    style.configure("AccentMuted.TLabel", background=SURFACE, foreground=ACCENT, font=("Segoe UI", 9))
 
     style.configure("TButton", background=SURFACE, foreground=TEXT, bordercolor=CONTROL_BORDER,
                     lightcolor=SURFACE, darkcolor=SURFACE, padding=(12, 5), focusthickness=0)
@@ -103,7 +106,7 @@ def configure_styles(style: ttk.Style) -> None:
                     rowheight=26, font=FONT, borderwidth=0)
     style.map("Treeview", background=[("selected", SELECTION)], foreground=[("selected", TEXT)])
     style.configure("Treeview.Heading", background="#FAFAFA", foreground=TEXT_SECONDARY,
-                    font=("Segoe UI Semibold", 9), relief="flat", padding=(8, 6),
+                    font=("Segoe UI Semibold", 9), relief="flat", padding=(8, 5),
                     bordercolor=BORDER, lightcolor="#FAFAFA", darkcolor=BORDER)
     style.map("Treeview.Heading", background=[("active", "#F0F0F0")])
 

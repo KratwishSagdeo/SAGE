@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from .. import __version__
 from ..config import APP_NAME, APP_SUBTITLE, MIN_WINDOW_SIZE, WINDOW_SIZE
 from ..models import ScanResult, VolumeInfo
-from ..platform.windows.drives import list_ntfs_volumes
+from ..platform.windows.drives import get_disk_space, list_ntfs_volumes
 from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
 from ..services.cleanup import CleanupSuggestion, cleanup_report
 from ..services.evidence import EvidenceAssistant, format_bytes
@@ -45,7 +45,7 @@ class _ScanProgress:
 class SageApplication(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"{APP_NAME} {__version__} â€” {APP_SUBTITLE}")
+        self.title(f"{APP_NAME} {__version__} — {APP_SUBTITLE}")
         self.geometry(WINDOW_SIZE)
         self.minsize(*MIN_WINDOW_SIZE)
         configure_styles(ttk.Style(self))
@@ -77,14 +77,14 @@ class SageApplication(tk.Tk):
         self._load_volumes()
 
     def _warm_ai(self) -> None:
-        self.assistant_panel.set_status("Loading local AI in the backgroundâ€¦")
+        self.assistant_panel.set_status("Loading local AI…")
 
         def worker() -> None:
             try:
                 OllamaClient().chat([])
-                status = "Local AI ready"
+                status = "Ready for your question."
             except RuntimeError:
-                status = "Local AI unavailable â€” basic scan answers still work"
+                status = "Local AI unavailable — basic scan answers still work"
             self._events.put(("ai_ready", self._generation, status))
 
         threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
@@ -110,10 +110,19 @@ class SageApplication(tk.Tk):
             header, textvariable=self.drive_var, state="readonly", width=26
         )
         self.drive_box.pack(side="right", padx=(8, 10))
+        self.drive_box.bind("<<ComboboxSelected>>", self._on_drive_changed)
         ttk.Label(header, text="Drive", style="HeaderField.TLabel").pack(side="right")
+
+        self._info_frame = ttk.Frame(self, style="Header.TFrame", padding=(18, 2, 18, 8))
+        self._info_frame.pack(fill="x")
+        self._scan_info_var = tk.StringVar(value="")
+        self._volume_info_var = tk.StringVar(value="")
+        ttk.Label(self._info_frame, textvariable=self._scan_info_var, style="HeaderInfo.TLabel").pack(side="left")
+        ttk.Label(self._info_frame, textvariable=self._volume_info_var, style="HeaderInfo.TLabel").pack(side="right")
+
         ttk.Separator(self, orient="horizontal").pack(fill="x")
 
-        progress_row = ttk.Frame(self, padding=(18, 10, 18, 10))
+        progress_row = ttk.Frame(self, padding=(18, 8, 18, 8))
         progress_row.pack(fill="x")
         self.progress_phase = tk.StringVar(value="Ready to scan")
         self.progress_detail = tk.StringVar(value="")
@@ -130,9 +139,21 @@ class SageApplication(tk.Tk):
         panes.add(right, weight=2)
         left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
-        ttk.Label(left, text="Drive contents", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
-            row=0, column=0, sticky="ew"
+        left_header = ttk.Frame(left, style="Surface.TFrame")
+        left_header.grid(row=0, column=0, sticky="ew")
+        left_header.columnconfigure(0, weight=1)
+        ttk.Label(left_header, text="Drive contents", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
+            row=0, column=0, sticky="w"
         )
+        self._sort_var = tk.StringVar(value="Name A\u2013Z")
+        self._sort_box = ttk.Combobox(
+            left_header, textvariable=self._sort_var, state="readonly", width=22,
+            values=["Name A\u2013Z", "Name Z\u2013A",
+                    "Logical size: largest", "Logical size: smallest",
+                    "Allocated size: largest", "Allocated size: smallest"]
+        )
+        self._sort_box.grid(row=0, column=1, padx=(0, 8), pady=(4, 4))
+        self._sort_box.bind("<<ComboboxSelected>>", self._on_sort_changed)
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
         self.tree_panel = TreePanel(left)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
@@ -190,12 +211,13 @@ class SageApplication(tk.Tk):
             self.assistant_panel.finish_reply("The drive scan changed. Ask again once the new tree is ready.")
         self._assistant_busy = False
         self.tree_panel.clear()
+        self._clear_drive_info()
         self.progress_bar.stop()
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start(12)
         self.progress_phase.set(f"Scanning {volume.drive} MFT")
-        self.progress_detail.set("Startingâ€¦")
-        self.status_var.set(f"Scanning {volume.drive} MFTâ€¦")
+        self.progress_detail.set("Starting…")
+        self.status_var.set(f"Scanning {volume.drive} MFT…")
         self.scan_button.configure(text="Restart scan")
         threading.Thread(
             target=self._scan_worker,
@@ -248,20 +270,28 @@ class SageApplication(tk.Tk):
                         self.progress_bar.configure(mode="indeterminate")
                         self.progress_bar.start(12)
                         self.progress_detail.set(f"{count:,} records")
-                        self.status_var.set(f"Scanning MFTâ€¦ {count:,} records")
+                        self.status_var.set(f"Scanning MFT\u2026 {count:,} records")
                     else:
                         self.progress_bar.stop()
                         self.progress_bar.configure(mode="determinate", value=fraction * 100)
-                        self.progress_detail.set(f"{fraction * 100:.0f}% est. Â· {count:,} records")
+                        elapsed = time.monotonic() - self._scan_started_at
+                        eta = ""
+                        if fraction > 0.05 and elapsed > 2:
+                            remaining = elapsed / fraction * (1 - fraction)
+                            if remaining >= 90:
+                                eta = f" \u00b7 About {remaining / 60:.0f} min remaining"
+                            elif remaining >= 5:
+                                eta = f" \u00b7 About {remaining:.0f} sec remaining"
+                        self.progress_detail.set(f"{fraction * 100:.0f}%{eta} \u00b7 {count:,} records")
                         self.status_var.set(
-                            f"Scanning MFTâ€¦ {fraction * 100:.0f}% estimated, {count:,} records"
+                            f"Scanning MFT\u2026 {fraction * 100:.0f}%, {count:,} records"
                         )
                 elif kind == "mft_stage":
                     self.progress_bar.configure(mode="indeterminate")
                     self.progress_bar.start(12)
                     self.progress_phase.set("Building drive tree")
-                    self.progress_detail.set("Please waitâ€¦")
-                    self.status_var.set(f"{event[2]}â€¦")
+                    self.progress_detail.set("Please wait…")
+                    self.status_var.set(f"{event[2]}…")
                 elif kind == "scan_done":
                     self._scan_finished(event[2])
                 elif kind == "size_progress":
@@ -270,9 +300,9 @@ class SageApplication(tk.Tk):
                     _, _, current, total, errors = event
                     percent = current / total * 100 if total else 100
                     self.progress_bar.configure(mode="determinate", value=percent)
-                    self.progress_detail.set(f"{percent:.1f}% Â· {current:,}/{total:,}")
+                    self.progress_detail.set(f"{percent:.1f}% · {current:,}/{total:,}")
                     self.status_var.set(
-                        f"Tree ready â€” measuring sizesâ€¦ {current:,}/{total:,} "
+                        f"Tree ready — measuring sizes… {current:,}/{total:,} "
                         f"({percent:.1f}%), unreadable: {errors:,}"
                     )
                     if time.monotonic() - self._last_tree_refresh >= 0.4:
@@ -328,6 +358,7 @@ class SageApplication(tk.Tk):
             self._assistant_busy = False
         self._conversation = ConversationAssistant(result)
         self.tree_panel.show_result(result)
+        self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
         self.scan_button.configure(text="Scan drive")
@@ -338,7 +369,7 @@ class SageApplication(tk.Tk):
         self.progress_phase.set("Measuring file sizes")
         self.progress_detail.set("0%")
         self.status_var.set(
-            f"MFT tree ready in {self._mft_elapsed:.1f}s â€” measuring file sizesâ€¦"
+            f"MFT tree ready in {self._mft_elapsed:.1f}s — measuring file sizes…"
         )
         threading.Thread(
             target=self._size_worker,
@@ -353,6 +384,7 @@ class SageApplication(tk.Tk):
         self.progress_bar.configure(mode="determinate", value=100)
         self.progress_phase.set("Drive scan complete")
         self.progress_detail.set("100%")
+        self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.size_summary())
         if result.volume.drive.upper() == "C:":
             suggestions = self._conversation.cleanup_suggestions()
@@ -360,7 +392,7 @@ class SageApplication(tk.Tk):
             self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
             self._conversation.remember_suggestions(suggestions)
         self.status_var.set(
-            f"Ready â€” MFT {self._mft_elapsed:.1f}s, "
+            f"Ready — MFT {self._mft_elapsed:.1f}s, "
             f"sizes {time.monotonic() - self._size_started_at:.1f}s, "
             f"{len(result.records):,} records, "
             f"{result.size_errors:,} unreadable files"
@@ -370,7 +402,7 @@ class SageApplication(tk.Tk):
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate", value=0)
         self.progress_phase.set(f"{phase} failed")
-        self.progress_detail.set("â€”")
+        self.progress_detail.set("—")
         self.scan_button.configure(text="Scan drive")
         self.status_var.set(f"{phase} failed.")
         self.assistant_panel.write("SAGE", f"{phase} failed:\n{exc}")
@@ -441,12 +473,12 @@ class SageApplication(tk.Tk):
         menu.add_command(label="Cut", command=self._cut_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Paste", command=self._paste_selection,
                          state="normal" if self._clipboard_paths and not self._file_operation_running else "disabled")
-        menu.add_command(label="Copy toâ€¦", command=self._copy_to, state="normal" if selected else "disabled")
-        menu.add_command(label="Move toâ€¦", command=self._move_to, state="normal" if selected else "disabled")
+        menu.add_command(label="Copy to…", command=self._copy_to, state="normal" if selected else "disabled")
+        menu.add_command(label="Move to…", command=self._move_to, state="normal" if selected else "disabled")
         menu.add_separator()
-        menu.add_command(label="Renameâ€¦", command=self._rename_selection,
+        menu.add_command(label="Rename…", command=self._rename_selection,
                          state="normal" if len(paths) == 1 and selected else "disabled")
-        menu.add_command(label="Send to Recycle Binâ€¦", command=self._recycle_selection,
+        menu.add_command(label="Send to Recycle Bin…", command=self._recycle_selection,
                          state="normal" if selected else "disabled")
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -616,8 +648,8 @@ class SageApplication(tk.Tk):
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start(12)
         self.progress_phase.set(f"Windows: {action}")
-        self.progress_detail.set("Workingâ€¦")
-        self.status_var.set(f"Windows is performing: {action}â€¦")
+        self.progress_detail.set("Working…")
+        self.status_var.set(f"Windows is performing: {action}…")
         generation = self._generation
         owner_hwnd = self.winfo_id()
 
@@ -654,7 +686,48 @@ class SageApplication(tk.Tk):
                 self._size_finished(self._pending_size_completion)
                 self._pending_size_completion = None
             elif self._result is not None and not self._result.sizes_complete:
-                self.status_var.set("Copy finished â€” background size analysis continues.")
+                self.status_var.set("Copy finished — background size analysis continues.")
+
+    def _on_sort_changed(self, _event: object = None) -> None:
+        mode_map = {
+            "Name A\u2013Z": "name_asc",
+            "Name Z\u2013A": "name_desc",
+            "Logical size: largest": "logical_desc",
+            "Logical size: smallest": "logical_asc",
+            "Allocated size: largest": "allocated_desc",
+            "Allocated size: smallest": "allocated_asc",
+        }
+        mode = mode_map.get(self._sort_var.get(), "name_asc")
+        self.tree_panel.apply_sort(mode)
+
+    def _on_drive_changed(self, _event: object = None) -> None:
+        self._clear_drive_info()
+
+    def _update_drive_info(self) -> None:
+        """Refresh the header with scan totals and volume capacity."""
+        result = self._result
+        if result is None:
+            self._clear_drive_info()
+            return
+        if result.sizes_complete:
+            logical, allocated = result.directory_sizes.get(result.root_frn, (0, 0))
+            self._scan_info_var.set(
+                f"Scan: {format_bytes(logical)} logical \u00b7 {format_bytes(allocated)} allocated"
+            )
+        else:
+            self._scan_info_var.set("Scan sizes: measuring\u2026")
+        try:
+            total, used, free = get_disk_space(result.volume.drive)
+            self._volume_info_var.set(
+                f"Volume: {format_bytes(total)} capacity \u00b7 "
+                f"{format_bytes(used)} used \u00b7 {format_bytes(free)} free"
+            )
+        except OSError:
+            self._volume_info_var.set("")
+
+    def _clear_drive_info(self) -> None:
+        self._scan_info_var.set("")
+        self._volume_info_var.set("")
 
     def _close(self) -> None:
         if self._file_operation_running:

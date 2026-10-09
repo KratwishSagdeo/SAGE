@@ -27,8 +27,14 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
     if not drive or not parts:
         return {"risk": "protected", "guidance": "Do not delete or move a drive root."}
     first = parts[0]
+    # ponytail: path rules identify likely roles, not installed dependencies.
+    # Add verified application/known-folder evidence here when available.
+    if ".git" in parts or first == "git" or "git" in parts:
+        return {"risk": "protected", "guidance": "This is repository metadata. Deleting it can lose local history, branches and uncommitted repository state; moving it alone can break the repository. Keep it with its project."}
+    if first == "users" and len(parts) <= 2:
+        return {"risk": "protected", "guidance": "This is a user-profile container. Do not delete or move the whole container; inspect its individual documents, downloads and application data instead."}
     if first in {"program files", "program files (x86)", "programdata", "system volume information", "recovery"}:
-        action = "Uninstall an unwanted application through Windows Settings." if first.startswith("program files") else "Use Windows Storage cleanup or the relevant application settings."
+        action = "Use Windows Installed apps to uninstall an application you no longer use." if first.startswith("program files") else "Use Windows Storage cleanup or the relevant application settings."
         return {"risk": "protected", "guidance": f"Do not directly delete or move this system/application location. {action}"}
     if drive == system:
         if first in {"windows", "boot"}:
@@ -36,9 +42,15 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
         if first in {"pagefile.sys", "swapfile.sys", "hiberfil.sys"}:
             return {"risk": "protected", "guidance": "Windows manages this file; do not delete it directly."}
         if first == "users" and "appdata" in parts:
+            if len(parts) >= 6 and parts[2:6] == ["appdata", "local", "pip", "cache"]:
+                return {"risk": "managed_cleanup", "guidance": "This matches pip's conventional cache location, not installed packages. Verify the exact cache with `python -m pip cache dir`; if it matches, use `python -m pip cache purge`. Purging discards cached downloads/wheels and may require downloading or rebuilding them later. Do not move the folder manually."}
+            if len(parts) >= 5 and parts[2:5] == ["appdata", "local", "temp"]:
+                return {"risk": "managed_cleanup", "guidance": "This matches the user temporary-data location. Some files may still be in use. Use Windows Temporary files cleanup for eligible contents; do not delete or relocate the entire Temp folder."}
             return {"risk": "protected", "guidance": "Application data can contain settings and state. Do not delete the folder directly."}
     if "downloads" in parts or "documents" in parts or "desktop" in parts:
         return {"risk": "review", "guidance": "Personal files require your review and a backup check before removal."}
+    if ntpath.splitext(normalized)[1] == ".log":
+        return {"risk": "unknown", "guidance": "The .log extension suggests a log, but does not establish its owner, retention needs or whether it is in use. Which application created it, and do you need its diagnostic history? Its contents have not been read."}
     return {"risk": "unknown", "guidance": "The scan alone cannot establish that deleting or moving this path is safe."}
 
 
@@ -58,7 +70,7 @@ class ScanEvidence:
         "or", "please", "remove", "should", "that", "the", "this", "to", "what", "which", "would", "you",
         "about", "big", "details", "give", "information", "large", "largest", "biggest", "list", "much",
         "overview", "show", "size", "space", "storage", "tell", "use", "used", "uses", "using", "taking",
-        "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its", "safe", "free", "clear",
+        "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its", "itself", "safe", "free", "clear",
         "clean", "cleanup", "junk", "inside", "not", "avoid", "never", "shouldn", "t", "explain", "really", "so", "needed", "necessary", "sensitive", "private", "contains", "contain", "why", "where", "there", "here", "c", "d",
     })
 
@@ -116,8 +128,9 @@ class ScanEvidence:
                     partial.append(record.frn)
             found = exact[:limit] if exact else partial[:limit]
             exact_match = bool(exact)
+        match_type = "exact" if exact_match else ("partial" if found else "none")
         return {"items": [self._entry(self.result.records[frn]) for frn in found], "searched_terms": terms,
-                "exact": exact_match}
+                "exact": exact_match, "match_type": match_type}
 
     def _allocated(self, record: FileRecord) -> int:
         if record.is_directory:
@@ -291,8 +304,61 @@ class ScanEvidence:
                 None,
             )
             if current is None:
-                return {"error": "Path was not found in the current scan.", "path": path}
-        return self._entry(result.records[current])
+                break
+        if current is not None:
+            return self._entry(result.records[current])
+        name = ntpath.basename(requested)
+        for record in result.records.values():
+            if record.name.casefold() == name.casefold():
+                actual = result.path_for(record.frn)
+                if actual and ntpath.normcase(actual) == requested:
+                    return self._entry(record)
+        return {"error": "Path was not found in the current scan.", "path": path}
+
+    def scoped_items(self, path: str, limit: int = 8) -> dict:
+        """Direct children only: do not mistake a tiny nested component for a candidate."""
+        parent = self.inspect(path)
+        if "error" in parent:
+            return parent
+        records = [self.result.records[frn] for frn in self.result.children.get(parent["frn"], ())]
+        biggest = heapq.nlargest(limit, records, key=lambda record: self.result.directory_sizes.get(record.frn, (0, 0))[1] if record.is_directory else record.allocated_size)
+        return {"items": [self._entry(record) for record in biggest], "total_children": len(records)}
+
+    def cleanup_candidates(self, path: str, limit: int = 6) -> dict:
+        """Rank conditional candidates in the requested subtree, not the whole drive."""
+        parent = self.inspect(path)
+        if "error" in parent:
+            return parent
+        if not self.result.sizes_complete:
+            return {"status": "sizes_pending", "items": []}
+        def candidates():
+            pending = [(parent["frn"], parent["path"])]
+            while pending:
+                frn, current_path = pending.pop()
+                record = self.result.records[frn]
+                risk = assess_path(current_path)["risk"]
+                if record.attributes & (0x400 | 0x4):
+                    continue
+                if frn != parent["frn"] and risk in {"managed_cleanup", "review"}:
+                    if not record.is_directory or risk == "managed_cleanup":
+                        entry = self._entry(record)
+                        if entry["allocated_bytes"]:
+                            yield entry
+                        continue
+                if record.is_directory:
+                    parts = ntpath.normcase(current_path).split("\\")
+                    if ".git" in parts or (len(parts) == 2 and parts[1] in {"windows", "program files", "program files (x86)", "programdata", "recovery", "system volume information"}):
+                        continue
+                    if "appdata" in parts and "programs" in parts:
+                        continue
+                    if "appdata" in parts and risk == "protected":
+                        index = parts.index("appdata")
+                        suffix = parts[index + 1:]
+                        if suffix and suffix not in (["local"], ["local", "pip"]):
+                            continue
+                    pending.extend((child, ntpath.join(current_path, self.result.records[child].name)) for child in self.result.children.get(frn, ()))
+        ranked = heapq.nlargest(limit, candidates(), key=lambda item: item["allocated_bytes"])
+        return {"status": "complete", "items": ranked, "scope": parent["path"], "size_errors": self.result.size_errors}
 
     @staticmethod
     def within(path: str, scope: str) -> bool:

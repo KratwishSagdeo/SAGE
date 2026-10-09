@@ -77,3 +77,23 @@ def list_ntfs_volumes() -> list[VolumeInfo]:
         if info.filesystem.upper() == "NTFS":
             volumes.append(info)
     return volumes
+
+
+def get_disk_space(drive: str) -> tuple[int, int, int]:
+    """Return (total_bytes, used_bytes, free_bytes) for a volume."""
+    kernel32 = _kernel32()
+    free_available = ctypes.c_ulonglong()
+    total_bytes = ctypes.c_ulonglong()
+    free_bytes = ctypes.c_ulonglong()
+    root = drive.rstrip("\\/").upper() + "\\"
+    ok = kernel32.GetDiskFreeSpaceExW(
+        root,
+        ctypes.byref(free_available),
+        ctypes.byref(total_bytes),
+        ctypes.byref(free_bytes),
+    )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+    total = total_bytes.value
+    free = free_bytes.value
+    return total, total - free, free

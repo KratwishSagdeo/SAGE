@@ -123,6 +123,7 @@ class ConversationAssistant:
         self.history: list[dict[str, str]] = []
         self._confirmed_path: str | None = None
         self._pending: dict | None = None
+        self._recent_items: list[dict] = []
         self._listed_items: list[dict] = []
         self._displayed_suggestions: list[CleanupSuggestion] = []
         self._cleanup: list[CleanupSuggestion] | None = None
@@ -148,6 +149,29 @@ class ConversationAssistant:
         self.history = self.history[-8:]
         return reply
 
+    @staticmethod
+    def _normalize(question: str) -> str:
+        """Repair observed intent typos, never rewrite a quoted name or path."""
+        replacements = {"shoild": "should", "delelet": "delete", "delelt": "delete", "sadfe": "safe", "importanty": "important"}
+        return re.sub(r'`[^`]*`|"[^"]*"|[A-Za-z]:\\[^\n?]*|\b\w+\b',
+                      lambda match: replacements.get(match[0].lower(), match[0]), question)
+
+    def _cleanup_reply(self, scope: str) -> str:
+        assert self.evidence is not None
+        candidates = self.evidence.cleanup_candidates(scope)
+        if candidates.get("status") == "sizes_pending":
+            return f"I can inspect `{scope}`, but size measurement is still running. I will rank cleanup candidates when measured sizes are available."
+        lines = [f"Cleanup assessment within `{scope}` — conditional candidates, not permission to delete:"]
+        for item in candidates.get("items", ()):
+            lines.append(f"• `{item['path']}` — {item['allocated_display']} allocated. {item['cleanup_risk']['guidance']}")
+        if not candidates.get("items"):
+            lines.append("I have not identified a candidate using the current metadata rules in this scope. This does not mean nothing can be removed. Name a child folder so we can establish its purpose and owner.")
+        if candidates.get("size_errors"):
+            lines.append("Some file sizes are unreadable, so measurements can be incomplete; that does not determine how those files should be cleaned.")
+        lines.append("Recycling keeps data on the same drive until the Recycle Bin is emptied; moving to another folder on this drive does not free drive space.")
+        self._confirmed_path = scope
+        return "\n\n".join(lines)
+
     def _quick_reply(self, question: str) -> str | None:
         query = question.strip().casefold().strip(".!? ")
         if query in {"hi", "hey", "hello", "hello sage", "hey sage", "hi sage", "good morning", "good evening"}:
@@ -164,6 +188,14 @@ class ConversationAssistant:
                 return "The tree is ready, but size measurement is still running. I'll have the measured total when it finishes."
             logical, allocated = self.result.directory_sizes.get(self.result.root_frn, (0, 0))
             return f"Scanned files on {self.result.volume.drive} use **{format_bytes(allocated)} allocated**, with **{format_bytes(logical)} logical size**."
+        if self.evidence and query in {"how much space does it use", "how much space does that use", "how big is it", "how large is it", "what is its size", "what's its size", "how much space does it take up"}:
+            paths = [self._confirmed_path] if self._confirmed_path and not self._pending else []
+            if len(paths) == 1:
+                item = self.evidence.inspect(paths[0])
+                if "error" not in item:
+                    if item.get("allocated_display") == "pending":
+                        return f"I'm still waiting for the measured size of `{paths[0]}`; size analysis is running."
+                    return f"`{paths[0]}` uses **{item['allocated_display']} allocated**, with **{item['logical_display']} logical size**."
         return None
 
     @staticmethod
@@ -193,7 +225,7 @@ class ConversationAssistant:
                 continue
             enclosed = match.start() > 0 and text[match.start() - 1] in '"\x60\x27'
             if not enclosed:
-                value = re.split(r"\s+(?:is|are|uses|holds|contains|takes|safe to|to free|to save|instead)\b", value, maxsplit=1, flags=re.I)[0]
+                value = re.split(r"\s+(?=(?:should|can|could|what|does|do|is|are|uses|holds|contains|takes|safe to|to free|to save|for cleanup|instead)\b)", value, maxsplit=1, flags=re.I)[0]
                 if quoted:
                     for suggestion in self.cleanup_suggestions():
                         value = re.split(r"\s+(?:[—–-]\s*)?" + re.escape(suggestion.title) + r"\b", value, maxsplit=1, flags=re.I)[0]
@@ -271,13 +303,14 @@ class ConversationAssistant:
             name = match[1].strip().rstrip("?!.")
             name = re.sub(r"^(?:file|folder|directory)\s+(?:named|called)\s+", "", name, flags=re.I)
             name = re.sub(r"\s+(?:file|folder|directory)$", "", name, flags=re.I)
-            if name and not re.search(r"\b(?:it|its|that|this|them|those|file|files|folder|folders|items|anything|everything|some|space|storage|drive|largest|biggest|top|inside|using|taking)\b", name, re.I):
+            if name and not re.search(r"\b(?:it|its|itself|that|this|them|those|here|file|files|folder|folders|items|anything|everything|some|space|storage|drive|largest|biggest|top|inside|using|taking)\b", name, re.I):
                 return name
         return None
 
     def _context(self, question: str, request: dict, quoted: str = "", *, choice: dict | None = None, scope: str | None = None) -> dict:
         assert self.evidence is not None and self.result is not None
         task = request["task"]
+        initial_scope = scope
         if re.search(r"\b(?:sensitive|private|confidential)\b", question, re.I):
             return self._clarify(question, request, "Do you mean files needed by Windows/apps, or files containing private information? This scan does not read file contents.")
         subject_question = question
@@ -305,7 +338,8 @@ class ConversationAssistant:
         drives = re.findall(r"\b([A-Za-z])\s+drive\b|\b([A-Za-z]):(?!\\)|\b(?:in|on)\s+([A-Za-z])(?=\s*[?!.]?$)", drive_text, re.I)
         drives = {next(value for value in group if value).upper() + ":" for group in drives}
         if drives and drives != {self.result.volume.drive.upper()}:
-            return self._clarify(question, request, f"This conversation uses the {self.result.volume.drive} scan. Did you mean that drive, or do you want to scan another drive?")
+            other_drive = next(iter(drives))
+            return self._clarify(question, request, f"The current scan is {self.result.volume.drive}. Scan {other_drive} first to inspect it.")
         subject = source
         if choice is None:
             clause = re.search(r"\b(?:in|inside|under|within)\s+(?:the\s+)?(.+?)\s*[?!.]*$", source, re.I)
@@ -330,7 +364,8 @@ class ConversationAssistant:
                 for path in paths:
                     matches = self._resolve(path, scope)
                     if not matches:
-                        return self._clarify(question, request, f"I could not find \x60{path}\x60 in the {self.result.volume.drive} scan. Please provide the exact path.", scope=scope)
+                        self._confirmed_path = None
+                        return self._clarify(question, request, f"I could not resolve \x60{path}\x60: Path was not found in the current scan. Please provide the exact path.", scope=scope)
                     items.extend(matches)
             else:
                 name = self._name_in(subject)
@@ -339,7 +374,7 @@ class ConversationAssistant:
                     if not items:
                         partial = [item for item in self.evidence.search(name, 7).get("items", []) if item.get("path") and (not scope or self.evidence.within(item["path"], scope))]
                         if partial:
-                            return self._clarify(question, request, "These are partial name matches. Which item do you mean? Reply with its number or full path:\n" + self._choices(partial), partial, scope)
+                            return self._clarify(question, request, f"I found a partial name match: 1. \x60{partial[0]['path']}\x60. Is that the item you mean? Reply 1 or provide the exact path.", partial, scope)
                         return self._clarify(question, request, f"I could not find an exact match for \x60{name}\x60. Please provide its full path.", scope=scope)
                 elif self._size_question(question) and re.search(r"\b(?:it|its|that)\b", question, re.I):
                     items = []
@@ -348,8 +383,8 @@ class ConversationAssistant:
                 else:
                     lookup = self.evidence.mentioned(subject, 7)
                     items = [item for item in lookup["items"] if item.get("path") and (not scope or self.evidence.within(item["path"], scope))]
-                    if items and not lookup["exact"]:
-                        return self._clarify(question, request, "These are partial name matches. Which item do you mean? Reply with its number or full path:\n" + self._choices(items), items, scope)
+                    if items and not lookup.get("exact"):
+                        return self._clarify(question, request, f"I found a partial name match: 1. \x60{items[0]['path']}\x60. Is that the item you mean? Reply 1 or provide the exact path.", items, scope)
             if len(items) > 1:
                 return self._clarify(question, request, "Which item do you mean? Reply with its number or full path:\n" + self._choices(items), items, scope)
             choice = items[0] if items else None
@@ -358,11 +393,11 @@ class ConversationAssistant:
             if self._confirmed_path is None:
                 if self._listed_items:
                     return self._clarify(question, request, "Which listed item do you mean? Reply with its number or full path:\n" + self._choices(self._listed_items), list(self._listed_items))
-                return self._clarify(question, request, "Which file or folder do you mean? Name it, give its full path, or highlight the relevant chat text.")
+                return self._clarify(question, request, "Which file, folder or drive do you mean? Name it, give its full path, or highlight the relevant chat text.", role="scope" if task == "cleanup" else "target")
             matches = self._resolve(self._confirmed_path)
             choice = matches[0] if matches else None
             if choice is None:
-                return self._clarify(question, request, "The previous item is no longer in this scan. Please provide its exact path.")
+                return self._clarify(question, request, "Which file, folder or drive do you mean? Name it, give its full path, or highlight the relevant chat text.", role="scope" if task == "cleanup" else "target")
         if choice is None:
             if scope:
                 choice = self.evidence.inspect(scope)
@@ -373,8 +408,10 @@ class ConversationAssistant:
                 self._pending = None
                 return {"request": request, "drive": self.result.volume.drive, "selected_text": quoted[:1500], "contents_read": False, "references": [], "matched_items": [], "selected_items": []}
             else:
-                return self._clarify(question, request, "Which file or folder should I explain? Please name it, give its full path, or highlight the relevant chat text.")
+                return self._clarify(question, request, "Which file, folder or drive should I explain? Please name it, give its full path, or highlight the relevant chat text.")
         scope = choice["path"]
+        if task == "cleanup" and choice.get("kind") == "drive" and not drives and not re.search(r"\b(?:in|inside|under|within)\b", question, re.I) and not initial_scope and not (self._pending and self._pending.get("role") == "scope"):
+            return self._clarify(question, request, f"Which scope should I assess: the scanned {self.result.volume.drive} drive, or a particular folder? Provide the drive or full folder path.", role="scope")
         if task in {"largest", "protected", "cleanup"} and choice["kind"] == "file":
             if task == "cleanup":
                 task = request["task"] = "assess_delete"
@@ -384,6 +421,7 @@ class ConversationAssistant:
             "request": {key: value for key, value in request.items() if key != "subject_question"}, "drive": self.result.volume.drive, "scope": scope,
             "scan_time": self.result.scanned_at.isoformat(), "sizes_complete": self.result.sizes_complete,
             "unreadable_files": self.result.size_errors, "contents_read": False, "references": [],
+            "drive_summary": self.evidence.drive_summary(),
             "target": self._compact(choice), "matched_items": [self._compact(choice)], "selected_items": [],
             "limitations": ["Metadata does not verify contents, ownership, dependencies, or backups."],
         }
@@ -392,6 +430,26 @@ class ConversationAssistant:
             context["limitations"].append("The destination and application path dependencies have not been verified.")
         if quoted:
             context["selected_text"] = quoted[:1500]
+        if choice["kind"] in {"folder", "drive"}:
+            scoped_res = self.evidence.scoped_items(choice["path"])
+            if "items" in scoped_res:
+                context["direct_children"] = {
+                    "total_children": scoped_res.get("total_children"),
+                    "sample": [self._compact(item) for item in scoped_res.get("items", ())]
+                }
+            contents = {}
+            for entry in [choice][:3]:
+                if entry.get("kind") == "folder" and entry.get("frn") is not None:
+                    contents[entry["path"]] = self.evidence.largest_children(entry["frn"], 8)
+                    inside = [
+                        f"{s.path} — {format_bytes(s.allocated)} ({s.title})"
+                        for s in self.cleanup_suggestions()
+                        if s.path.casefold().startswith(entry["path"].casefold().rstrip("\\") + "\\")
+                    ]
+                    if inside:
+                        context.setdefault("cleanup_inside", {})[entry["path"]] = inside
+            if contents:
+                context["contents_by_size"] = contents
         if choice["kind"] in {"folder", "drive"} and not self._size_question(question) and (
             task in {"explain", "overview", "assess_delete", "assess_move"} or task == "cleanup" and choice.get("cleanup_risk", {}).get("risk") == "protected"
         ):
@@ -404,24 +462,34 @@ class ConversationAssistant:
         elif task in {"largest", "protected"}:
             ranked = self.evidence.largest(request["kind"], request["limit"], scope=scope, protected_only=task == "protected")
             context["ranked"] = {**ranked, "items": [self._compact(item) for item in ranked.get("items", [])]}
-        pool = self.cleanup_suggestions() if task in {"cleanup", "assess_delete", "assess_move"} else self._cleanup or []
-        suggestions = [s for s in pool if self.evidence.within(s.path, scope)]
-        if task == "cleanup":
-            if request["kind"] != "items":
-                suggestions = [s for s in suggestions if self.evidence.inspect(s.path).get("kind") == request["kind"].rstrip("s")]
+        all_suggestions = self.cleanup_suggestions()
+        exact = next((s for s in all_suggestions if ntpath.normcase(s.path) == ntpath.normcase(scope)), None)
+        if exact:
+            desc = f"{exact.title}. {exact.reason}"
+            context["target"]["rule_matched_cleanup"] = desc
+            context["target"]["verified_cleanup"] = desc
+            context["matched_items"][0]["rule_matched_cleanup"] = desc
+            context["matched_items"][0]["verified_cleanup"] = desc
+        if (re.search(r"\b(delete|remove|clean|clear|free|space|safe|cache|junk|it|that|those|them)\b", question, re.I) or task in {"cleanup", "assess_delete", "assess_move"}) and all_suggestions:
             context["cleanup_candidates"] = [
                 {"path": s.path, "size": format_bytes(s.allocated), "what": s.title, "reason": s.reason}
-                for s in suggestions[:request["limit"]]
+                for s in all_suggestions
             ]
-            context["limitations"].append("Candidates are limited to the existing C: cleanup list: up to 12 rule matches over 20 MB, not all removable files.")
-        exact = next((s for s in suggestions if ntpath.normcase(s.path) == ntpath.normcase(scope)), None)
-        if exact:
-            context["target"]["rule_matched_cleanup"] = f"{exact.title}. {exact.reason}"
-            context["matched_items"][0]["rule_matched_cleanup"] = context["target"]["rule_matched_cleanup"]
+        if followup and self._recent_items:
+            context["previous_items"] = self._recent_items[:4]
+        if choice:
+            self._recent_items = [self._compact(choice)]
         if task in {"assess_delete", "assess_move", "cleanup"}:
             risk = choice.get("cleanup_risk", {})
             context["action_policy"] = {"risk": risk.get("risk"), "reason": risk.get("guidance"), "rule_matched_cleanup": exact is not None}
-            context["actionable_candidates"] = [s.path for s in (suggestions[:request["limit"]] if task == "cleanup" else [exact] if exact and task == "assess_delete" else [])]
+            if quoted and exact:
+                context["actionable_candidates"] = [exact.path]
+            elif exact and task == "assess_delete":
+                context["actionable_candidates"] = [exact.path]
+            elif task == "cleanup":
+                context["actionable_candidates"] = [s.path for s in all_suggestions[:request["limit"]]]
+            else:
+                context["actionable_candidates"] = []
         self._confirmed_path = scope
         self._pending = None
         self._listed_items = []
@@ -444,6 +512,9 @@ class ConversationAssistant:
             self.last_timings["total_seconds"] = time.perf_counter() - started
             return self._remember(question, reply)
         # Keep the UI signature, but tree navigation is not a chat-target selection.
+        question = self._normalize(question)
+        if quoted or re.search(r"[A-Za-z]:\\", question):
+            selected_paths = ()
         quick = None if quoted else self._quick_reply(question)
         if quick:
             return finish(quick)
@@ -472,8 +543,8 @@ class ConversationAssistant:
                 if ordinal:
                     request = dict(pending["request"])
                     resolved_question = pending["question"]
-                scope = pending["scope"]
-                if pending["role"] == "scope":
+                scope = pending.get("scope")
+                if pending.get("role") == "scope":
                     scope = choice["path"]
                     choice = None
                     resolved_question = re.sub(r"\b(?:in|inside|under|within)\s+.*$", "", pending["question"], flags=re.I)
@@ -482,16 +553,16 @@ class ConversationAssistant:
                 request = self._request(resolved_question)
         elif self._pending and not quoted:
             value = question.strip().strip('"\x60').rstrip("?!.")
-            location_only = bool(re.match(r'^[A-Za-z]:\\', value)) or bool(self.evidence.resolve_name(value, self._pending["scope"]))
+            location_only = bool(re.match(r'^[A-Za-z]:', value)) or bool(self.evidence.resolve_name(value, self._pending.get("scope")))
             if location_only:
                 pending = self._pending
-                matches = self._resolve(value, pending["scope"], as_scope=pending["role"] == "scope")
+                matches = self._resolve(value, pending.get("scope"), as_scope=pending.get("role") == "scope")
                 if len(matches) == 1:
                     request = dict(pending["request"])
                     resolved_question = pending["question"]
-                    scope = pending["scope"]
+                    scope = pending.get("scope")
                     choice = matches[0]
-                    if pending["role"] == "scope":
+                    if pending.get("role") == "scope" or request.get("task") == "cleanup":
                         scope, choice = choice["path"], None
                         resolved_question = re.sub(r"\b(?:in|inside|under|within)\s+.*$", "", pending["question"], flags=re.I)
         if on_status:
@@ -502,19 +573,27 @@ class ConversationAssistant:
         if context.get("clarification"):
             return finish(context["clarification"])
         target = context.get("target", {})
-        if request["task"] in {"assess_delete", "assess_move"} and target.get("risk") == "protected" and not target.get("rule_matched_cleanup"):
-            guidance = target["guidance"].split(". ", 1)[-1]
-            return finish(f"Do not directly delete or move \x60{target['path']}\x60. {guidance} The scan cannot verify that a manual deletion or relocation is safe.")
+        if request["task"] in {"assess_delete", "assess_move"}:
+            if target.get("risk") == "protected" and not target.get("rule_matched_cleanup"):
+                guidance = target["guidance"].split(". ", 1)[-1]
+                return finish(f"Do not directly delete or move \x60{target['path']}\x60. {guidance} The scan cannot verify that a manual deletion or relocation is safe.")
+            if not target.get("rule_matched_cleanup") and not target.get("verified_cleanup"):
+                risk = target.get("cleanup_risk") or {"risk": target.get("risk"), "guidance": target.get("guidance")}
+                self._confirmed_path = target["path"]
+                prefix = "Do not directly delete or move" if risk.get("risk") == "protected" else "Assessment for"
+                return finish(f"{prefix} \x60{target['path']}\x60 ({target.get('allocated', 'pending')} allocated). {risk.get('guidance', '')}")
         if request["task"] == "cleanup" and self.result.volume.drive.upper() != "C:":
             return finish(f"Automatic cleanup suggestions are enabled only for C:. Name a file or folder on {self.result.volume.drive} and I can help you review it.")
-        if request["task"] == "cleanup" and target.get("kind") == "drive" and not re.search(r"\b(?:largest|biggest|top)\b", question, re.I):
-            self.last_suggestions = self.cleanup_suggestions()
-            self.remember_suggestions(self.last_suggestions)
-            return finish(cleanup_report(self.result, self.last_suggestions))
-        if target and self._size_question(question):
-            if target["allocated"] == "pending":
-                return finish(f"The measured size of \x60{target['path']}\x60 is pending.")
-            return finish(f"\x60{target['path']}\x60 uses **{target['allocated']} allocated**, with **{target['size']} logical size**.")
+        if request["task"] == "cleanup" and not quoted:
+            if target.get("kind") == "drive" and not re.search(r"\b(?:largest|biggest|top)\b", resolved_question, re.I):
+                suggestions = self.cleanup_suggestions()
+                if suggestions:
+                    self.last_suggestions = suggestions
+                    self.remember_suggestions(self.last_suggestions)
+                    return finish(cleanup_report(self.result, self.last_suggestions))
+                return finish(self._cleanup_reply(target["path"]))
+            if target.get("kind") == "folder" and re.search(r"[A-Za-z]:\\", resolved_question):
+                return finish(self._cleanup_reply(target["path"]))
         messages = [
             {"role": "system", "content": SYSTEM_INSTRUCTIONS},
             *[{"role": turn["role"], "content": turn["content"][:500]} for turn in self.history[-4:]],
@@ -537,6 +616,11 @@ class ConversationAssistant:
                 raise RuntimeError("Local AI did not return a text answer.")
             actionable = set(context.get("actionable_candidates", []))
             self.last_suggestions = [s for s in self.cleanup_suggestions() if s.path in actionable] if actionable else []
+            if not self.last_suggestions and target and (target.get("rule_matched_cleanup") or target.get("verified_cleanup")):
+                self.last_suggestions = [s for s in self.cleanup_suggestions() if s.path.casefold() == target["path"].casefold()]
+            if not self.last_suggestions and quoted:
+                matched_paths = {item["path"].casefold() for item in context.get("matched_items", [])}
+                self.last_suggestions = [s for s in self.cleanup_suggestions() if s.path.casefold() in matched_paths]
             if context.get("ranked"):
                 self._listed_items = context["ranked"]["items"]
                 self._confirmed_path = self._listed_items[0]["path"] if len(self._listed_items) == 1 else None
