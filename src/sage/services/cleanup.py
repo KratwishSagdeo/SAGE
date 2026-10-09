@@ -38,6 +38,7 @@ class _Rule:
     action: str = "delete"
     directory: bool = True
     suffixes: tuple[str, ...] = ()
+    sibling: str = ""
 
 
 def _rule(names: str, pattern: str, title: str, reason: str, **options) -> _Rule:
@@ -95,13 +96,26 @@ _RULES = (
           "Downloaded build dependencies. Gradle downloads them again on the next build."),
     _rule("go-build", _USER + r"appdata\\local\\go-build$", "Go build cache",
           "Compiled Go build output. Rebuilt on the next build."),
-    _rule("node_modules", r"(^|\\)node_modules$", "node_modules (project dependencies)",
+    # Installed apps (Electron resources, extensions, global npm) ship node_modules too and cannot
+    # be restored with npm install, so only a top-level node_modules beside package.json qualifies.
+    _rule("node_modules",
+          r"^(?!(?:.*\\)?(?:program files[^\\]*|programdata|windows|appdata|resources|\.[^\\]+)\\)"
+          r"(?!.*node_modules\\)(?:.*\\)?node_modules$",
+          "node_modules (project dependencies)",
           "Installed packages for a JavaScript project. Run npm install in that project to restore them.",
-          contents_only=False),
+          contents_only=False, sibling="package.json"),
     _rule("", _USER + r"downloads\\[^\\]+$", "Installer in Downloads",
           "A setup or disk image file. You can download it again if you need to reinstall.",
           contents_only=False, directory=False, suffixes=(".exe", ".msi", ".msix", ".iso")),
 )
+
+
+def _has_sibling(result: ScanResult, parent_frn: int, name: str) -> bool:
+    records = result.records
+    return any(
+        child in records and records[child].name.casefold() == name
+        for child in result.children.get(parent_frn, ())
+    )
 
 
 def find_cleanup_suggestions(
@@ -134,6 +148,8 @@ def find_cleanup_suggestions(
                     break
                 relative = path[prefix:].casefold()
             if rule.pattern.search(relative):
+                if rule.sibling and not _has_sibling(result, record.parent_frn, rule.sibling):
+                    break
                 found.append(CleanupSuggestion(
                     path, rule.title, rule.reason, allocated, rule.contents_only, rule.action
                 ))

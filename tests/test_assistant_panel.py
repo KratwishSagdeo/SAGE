@@ -76,6 +76,19 @@ class AssistantPanelTests(unittest.TestCase):
         self.assertEqual(self.asked, [("is this safe?", "C:\\Windows\\Temp holds 2 GB.")])
         self.assertEqual(self.panel._quote, "")
 
+    def test_long_selection_keeps_clear_button_inside_the_bar(self):
+        self.root.geometry("420x500")
+        self.panel.pack(fill="both", expand=True)
+        self.panel.write("SAGE", "C:\\Users\\HP\\AppData\\Local\\Packages " * 20)
+        self.panel.transcript.tag_add("sel", "1.0", "end-1c")
+        self.panel._capture_selection()
+        self.root.update_idletasks()
+        bar = self.panel.quote_bar
+        button = next(child for child in bar.winfo_children() if isinstance(child, tk.ttk.Button))
+        self.assertLess(bar.winfo_reqwidth(), 420)
+        button.invoke()
+        self.assertEqual(self.panel._quote, "")
+
 
 class AssistantEventTests(unittest.TestCase):
     def test_old_answer_cannot_replace_current_request(self):

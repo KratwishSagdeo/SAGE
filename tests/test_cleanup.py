@@ -22,6 +22,8 @@ def cleanup_scan():
         (22, 21, "Download"), (23, 11, "Projects"), (24, 23, "site"), (25, 24, "node_modules"),
         (26, 25, "node_modules"), (27, 11, "Documents"), (28, 11, "Downloads"),
         (29, 5, "Program Files"), (30, 5, "Program Files (x86)"), (31, 30, "Steam"), (32, 30, "Zoom"),
+        (33, 5, "Tools"), (34, 33, "resources"), (35, 34, "app"), (36, 35, "node_modules"),
+        (37, 23, "loose"), (38, 37, "node_modules"),
     ]
     records = {5: FileRecord(5, 5, ".", D)}
     records.update({frn: FileRecord(frn, parent, name, D) for frn, parent, name in folders})
@@ -30,6 +32,8 @@ def cleanup_scan():
         (103, 26, "lib.js", 400), (104, 27, "thesis.docx", 5000), (105, 28, "tool-setup.exe", 250),
         (106, 28, "photo.png", 800), (107, 14, "tiny.tmp", 1),
         (108, 31, "game.pak", 9000), (109, 32, "zoom.exe", 300), (110, 29, "app.exe", 50),
+        (111, 24, "package.json", 0), (112, 36, "bundled.js", 500), (113, 35, "package.json", 0),
+        (114, 38, "orphan.js", 600),
     ]
     records.update({
         frn: FileRecord(frn, parent, name, 0, size * MB, size * MB, size_ready=True)
@@ -55,6 +59,8 @@ class CleanupSuggestionTests(unittest.TestCase):
         self.assertFalse(suggestions[2].contents_only)
         self.assertNotIn("thesis.docx", " ".join(paths))
         self.assertNotIn("photo.png", " ".join(paths))
+        self.assertNotIn("C:\\Tools\\resources\\app\\node_modules", paths)
+        self.assertNotIn("C:\\Users\\hp\\Projects\\loose\\node_modules", paths)
 
     def test_cleanup_question_answers_without_model_and_returns_buttons(self):
         def forbidden(_payload):
@@ -113,7 +119,30 @@ class ScopedQuestionTests(unittest.TestCase):
         context = self._context(payloads[0])
         self.assertEqual(context["selected_text"], quote)
         self.assertEqual(context["matched_items"][0]["path"], "C:\\Windows\\SoftwareDistribution\\Download")
+        self.assertIn("Windows Update download cache", context["matched_items"][0]["verified_cleanup"])
         self.assertEqual([s.path for s in assistant.last_suggestions], ["C:\\Windows\\SoftwareDistribution\\Download"])
+
+    def test_quoted_suggestion_ignores_protected_tree_selection(self):
+        assistant, payloads = self._assistant()
+        quote = "2. 250.0 MB C:\\Users\\hp\\Downloads\\tool-setup.exe Installer in Downloads."
+        answer = assistant.answer("Is this really safe to delete?", ("C:\\Program Files",), quoted=quote)
+        self.assertNotIn("Do not directly delete", answer)
+        context = self._context(payloads[0])
+        self.assertEqual(context["selected_items"], [])
+        self.assertIn("Installer in Downloads", context["matched_items"][0]["verified_cleanup"])
+
+    def test_every_suggestion_reaches_the_model_and_escaped_paths_are_fixed(self):
+        payloads = []
+
+        def fake(payload):
+            payloads.append(payload)
+            return {"message": {"content": "C:\\\\Users\\\\hp\\\\Downloads\\\\tool-setup.exe is safe to delete."}}
+
+        assistant = ConversationAssistant(cleanup_scan(), OllamaClient(transport=fake))
+        answer = assistant.answer("is C:\\Users\\hp\\Downloads\\tool-setup.exe safe to delete?")
+        candidates = self._context(payloads[0])["cleanup_candidates"]
+        self.assertEqual(len(candidates), len(assistant.cleanup_suggestions()))
+        self.assertTrue(answer.startswith("C:\\Users\\hp\\Downloads\\tool-setup.exe"))
 
 
 class PermanentDeleteTests(unittest.TestCase):

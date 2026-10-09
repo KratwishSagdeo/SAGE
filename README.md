@@ -34,7 +34,8 @@ over 20 MB that match known rules are listed: Windows Update and Delivery
 Optimization caches, Windows and user temp folders, crash dumps and error
 reports, browser and Electron app caches (Chrome, Edge, Brave, Firefox,
 Discord, Teams, VS Code, …), GPU shader caches, pip/npm/Yarn/NuGet/Gradle/Go
-caches, `node_modules` folders, installers (`.exe`, `.msi`, `.msix`, `.iso`) in
+caches, project `node_modules` folders (only beside a `package.json`, never
+inside installed apps, `AppData`, or `resources` folders), installers (`.exe`, `.msi`, `.msix`, `.iso`) in
 Downloads, the Recycle Bin, and `Windows.old` upgrade leftovers. Documents,
 photos, Program Files, and generic AppData folders are not listed. Nested
 matches are collapsed so the same space is never counted twice.
@@ -82,7 +83,7 @@ sizes.
 
 Select text anywhere in the assistant pane to ask about it, like quoting in a
 chat app. An "Asking about" bar appears above the input; the selected text is
-sent with the next question (or cleared with ✕), and any paths in it are
+sent with the next question (or cleared with **Clear**), and any paths in it are
 resolved against the scan.
 
 Other questions first resolve mentioned folder/file names in the current scan,
