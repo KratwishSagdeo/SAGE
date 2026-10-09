@@ -13,7 +13,7 @@ class TreePanel(ttk.Frame):
     COLUMNS = ("allocated", "logical", "items", "files", "folders", "attrs")
 
     def __init__(self, parent: tk.Misc) -> None:
-        super().__init__(parent)
+        super().__init__(parent, style="Surface.TFrame")
         self.result: ScanResult | None = None
         self.folder_icon, self.file_icon, self.drive_icon = self._make_icons()
         self.columnconfigure(0, weight=1)
@@ -67,18 +67,18 @@ class TreePanel(ttk.Frame):
     @staticmethod
     def _make_icons() -> tuple[tk.PhotoImage, tk.PhotoImage, tk.PhotoImage]:
         folder = tk.PhotoImage(width=18, height=18)
-        folder.put("#B77919", to=(1, 5, 17, 15))
-        folder.put("#E4AE48", to=(2, 6, 16, 14))
-        folder.put("#D18E27", to=(2, 3, 9, 6))
+        folder.put("#E8A317", to=(2, 4, 8, 6))
+        folder.put("#F2B635", to=(2, 6, 16, 15))
+        folder.put("#F7CB5E", to=(2, 7, 16, 8))
         file = tk.PhotoImage(width=18, height=18)
-        file.put("#4771A4", to=(3, 1, 14, 17))
-        file.put("#F8FBFF", to=(4, 2, 13, 16))
-        file.put("#A8BED9", to=(6, 7, 12, 8))
-        file.put("#A8BED9", to=(6, 10, 12, 11))
+        file.put("#9AA0A6", to=(4, 2, 14, 16))
+        file.put("#FFFFFF", to=(5, 3, 13, 15))
+        file.put("#C4C7CC", to=(7, 7, 11, 8))
+        file.put("#C4C7CC", to=(7, 10, 11, 11))
         drive = tk.PhotoImage(width=18, height=18)
-        drive.put("#4E637B", to=(1, 4, 17, 14))
-        drive.put("#AEBCCB", to=(2, 5, 16, 11))
-        drive.put("#52BE91", to=(13, 12, 15, 14))
+        drive.put("#5F6B7A", to=(2, 6, 16, 13))
+        drive.put("#8A96A3", to=(3, 7, 15, 11))
+        drive.put("#0F6CBD", to=(12, 11, 14, 12))
         return folder, file, drive
 
     def show_result(self, result: ScanResult) -> None:

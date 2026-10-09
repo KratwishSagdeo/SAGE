@@ -8,14 +8,16 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .. import __version__
 from ..config import APP_NAME, APP_SUBTITLE, MIN_WINDOW_SIZE, WINDOW_SIZE
 from ..models import ScanResult, VolumeInfo
 from ..platform.windows.drives import list_ntfs_volumes
-from ..platform.windows.file_operations import shell_file_operation
-from ..services.evidence import EvidenceAssistant
+from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
+from ..services.cleanup import CleanupSuggestion, cleanup_report
+from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import ConversationAssistant, OllamaClient
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
@@ -43,7 +45,7 @@ class _ScanProgress:
 class SageApplication(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"{APP_NAME} {__version__} — {APP_SUBTITLE}")
+        self.title(f"{APP_NAME} {__version__} â€” {APP_SUBTITLE}")
         self.geometry(WINDOW_SIZE)
         self.minsize(*MIN_WINDOW_SIZE)
         configure_styles(ttk.Style(self))
@@ -60,7 +62,6 @@ class SageApplication(tk.Tk):
         self._volumes: dict[str, VolumeInfo] = {}
         self._clipboard_paths: list[str] = []
         self._clipboard_action = "copy"
-        self._action_frns: list[int] = []
         self._file_operation_running = False
         self._last_tree_refresh = 0.0
         self._pending_size_completion: ScanResult | None = None
@@ -76,14 +77,14 @@ class SageApplication(tk.Tk):
         self._load_volumes()
 
     def _warm_ai(self) -> None:
-        self.assistant_panel.set_status("Loading local AI in the background…")
+        self.assistant_panel.set_status("Loading local AI in the backgroundâ€¦")
 
         def worker() -> None:
             try:
                 OllamaClient().chat([])
                 status = "Local AI ready"
             except RuntimeError:
-                status = "Local AI unavailable — basic scan answers still work"
+                status = "Local AI unavailable â€” basic scan answers still work"
             self._events.put(("ai_ready", self._generation, status))
 
         threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
@@ -96,45 +97,46 @@ class SageApplication(tk.Tk):
         self.focus_force()
 
     def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self, padding=(10, 8))
-        toolbar.pack(fill="x")
-        ttk.Label(toolbar, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        ttk.Label(toolbar, text=APP_SUBTITLE, style="Subtitle.TLabel").pack(
-            side="left", padx=(10, 20)
+        header = ttk.Frame(self, style="Header.TFrame", padding=(18, 12))
+        header.pack(fill="x")
+        ttk.Label(header, text=APP_NAME, style="App.TLabel").pack(side="left")
+        ttk.Label(header, text=APP_SUBTITLE, style="Subtitle.TLabel").pack(
+            side="left", padx=(12, 0), pady=(4, 0)
         )
-        ttk.Label(toolbar, text="NTFS drive:").pack(side="left")
+        self.scan_button = ttk.Button(header, text="Scan drive", style="Accent.TButton", command=self._start_scan)
+        self.scan_button.pack(side="right")
         self.drive_var = tk.StringVar()
         self.drive_box = ttk.Combobox(
-            toolbar, textvariable=self.drive_var, state="readonly", width=28
+            header, textvariable=self.drive_var, state="readonly", width=26
         )
-        self.drive_box.pack(side="left", padx=(6, 6))
-        self.scan_button = ttk.Button(toolbar, text="Scan MFT", command=self._start_scan)
-        self.scan_button.pack(side="left")
+        self.drive_box.pack(side="right", padx=(8, 10))
+        ttk.Label(header, text="Drive", style="HeaderField.TLabel").pack(side="right")
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
 
-        progress_row = ttk.Frame(self, padding=(10, 0, 10, 8))
+        progress_row = ttk.Frame(self, padding=(18, 10, 18, 10))
         progress_row.pack(fill="x")
-        self.progress_phase = tk.StringVar(value="Drive scan progress")
-        self.progress_detail = tk.StringVar(value="Ready")
-        ttk.Label(progress_row, textvariable=self.progress_phase, width=24).pack(side="left")
+        self.progress_phase = tk.StringVar(value="Ready to scan")
+        self.progress_detail = tk.StringVar(value="")
+        ttk.Label(progress_row, textvariable=self.progress_phase, style="Muted.TLabel", width=26).pack(side="left")
+        ttk.Label(progress_row, textvariable=self.progress_detail, style="Muted.TLabel", width=24, anchor="e").pack(side="right")
         self.progress_bar = ttk.Progressbar(progress_row, mode="determinate", maximum=100)
-        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8, 8))
-        ttk.Label(progress_row, textvariable=self.progress_detail, width=25, anchor="e").pack(side="right")
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8, 12))
 
         panes = ttk.Panedwindow(self, orient="horizontal")
-        panes.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        left = ttk.Frame(panes)
-        right = ttk.Frame(panes)
+        panes.pack(fill="both", expand=True, padx=14, pady=(0, 4))
+        left = ttk.Frame(panes, style="Card.TFrame", padding=1)
+        right = ttk.Frame(panes, style="Card.TFrame", padding=1)
         panes.add(left, weight=3)
         panes.add(right, weight=2)
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
-        ttk.Label(left, text="NTFS Evidence", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(10, 8)
+        ttk.Label(left, text="Drive contents", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
+            row=0, column=0, sticky="ew"
         )
+        ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
         self.tree_panel = TreePanel(left)
-        self.tree_panel.grid(row=1, column=0, sticky="nsew")
+        self.tree_panel.grid(row=2, column=0, sticky="nsew")
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
-        self.tree_panel.tree.bind("<Button-1>", lambda _event: self._action_frns.clear(), add="+")
         self.tree_panel.tree.bind("<Double-1>", self._open_on_double_click)
         self.tree_panel.tree.bind("<Control-c>", self._copy_selection)
         self.tree_panel.tree.bind("<Control-x>", self._cut_selection)
@@ -147,7 +149,7 @@ class SageApplication(tk.Tk):
 
         self.status_var = tk.StringVar(value="Ready")
         footer = ttk.Frame(self)
-        footer.pack(fill="x", padx=10, pady=(0, 6))
+        footer.pack(fill="x", padx=18, pady=(2, 6))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel").grid(
             row=0, column=0, sticky="ew"
@@ -181,7 +183,6 @@ class SageApplication(tk.Tk):
         generation = self._generation
         self._scan_started_at = time.monotonic()
         self._result = None
-        self._action_frns.clear()
         self._pending_size_completion = None
         self._assistant = EvidenceAssistant()
         self._conversation = ConversationAssistant()
@@ -193,8 +194,8 @@ class SageApplication(tk.Tk):
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start(12)
         self.progress_phase.set(f"Scanning {volume.drive} MFT")
-        self.progress_detail.set("Starting…")
-        self.status_var.set(f"Scanning {volume.drive} MFT…")
+        self.progress_detail.set("Startingâ€¦")
+        self.status_var.set(f"Scanning {volume.drive} MFTâ€¦")
         self.scan_button.configure(text="Restart scan")
         threading.Thread(
             target=self._scan_worker,
@@ -247,20 +248,20 @@ class SageApplication(tk.Tk):
                         self.progress_bar.configure(mode="indeterminate")
                         self.progress_bar.start(12)
                         self.progress_detail.set(f"{count:,} records")
-                        self.status_var.set(f"Scanning MFT… {count:,} records")
+                        self.status_var.set(f"Scanning MFTâ€¦ {count:,} records")
                     else:
                         self.progress_bar.stop()
                         self.progress_bar.configure(mode="determinate", value=fraction * 100)
-                        self.progress_detail.set(f"{fraction * 100:.0f}% est. · {count:,} records")
+                        self.progress_detail.set(f"{fraction * 100:.0f}% est. Â· {count:,} records")
                         self.status_var.set(
-                            f"Scanning MFT… {fraction * 100:.0f}% estimated, {count:,} records"
+                            f"Scanning MFTâ€¦ {fraction * 100:.0f}% estimated, {count:,} records"
                         )
                 elif kind == "mft_stage":
                     self.progress_bar.configure(mode="indeterminate")
                     self.progress_bar.start(12)
                     self.progress_phase.set("Building drive tree")
-                    self.progress_detail.set("Please wait…")
-                    self.status_var.set(f"{event[2]}…")
+                    self.progress_detail.set("Please waitâ€¦")
+                    self.status_var.set(f"{event[2]}â€¦")
                 elif kind == "scan_done":
                     self._scan_finished(event[2])
                 elif kind == "size_progress":
@@ -269,9 +270,9 @@ class SageApplication(tk.Tk):
                     _, _, current, total, errors = event
                     percent = current / total * 100 if total else 100
                     self.progress_bar.configure(mode="determinate", value=percent)
-                    self.progress_detail.set(f"{percent:.1f}% · {current:,}/{total:,}")
+                    self.progress_detail.set(f"{percent:.1f}% Â· {current:,}/{total:,}")
                     self.status_var.set(
-                        f"Tree ready — measuring sizes… {current:,}/{total:,} "
+                        f"Tree ready â€” measuring sizesâ€¦ {current:,}/{total:,} "
                         f"({percent:.1f}%), unreadable: {errors:,}"
                     )
                     if time.monotonic() - self._last_tree_refresh >= 0.4:
@@ -285,6 +286,9 @@ class SageApplication(tk.Tk):
                 elif kind == "assistant_answer":
                     self._assistant_busy = False
                     self.assistant_panel.finish_reply(event[3])
+                    if len(event) > 4 and event[4]:
+                        self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
+                        self._conversation.remember_suggestions(event[4])
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -317,7 +321,6 @@ class SageApplication(tk.Tk):
         self._mft_elapsed = time.monotonic() - self._scan_started_at
         self._size_started_at = time.monotonic()
         self._result = result
-        self._action_frns.clear()
         self._assistant.set_result(result)
         if self._assistant_busy:
             self._assistant_request_id += 1
@@ -327,13 +330,16 @@ class SageApplication(tk.Tk):
         self.tree_panel.show_result(result)
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
+        self.scan_button.configure(text="Scan drive")
+        if result.sizes_complete:
+            self._size_finished(result)
+            return
         self.progress_bar.configure(mode="determinate", value=0)
         self.progress_phase.set("Measuring file sizes")
         self.progress_detail.set("0%")
         self.status_var.set(
-            f"MFT tree ready in {self._mft_elapsed:.1f}s — measuring file sizes…"
+            f"MFT tree ready in {self._mft_elapsed:.1f}s â€” measuring file sizesâ€¦"
         )
-        self.scan_button.configure(text="Scan MFT")
         threading.Thread(
             target=self._size_worker,
             args=(self._generation, result, self._size_cancel),
@@ -348,8 +354,13 @@ class SageApplication(tk.Tk):
         self.progress_phase.set("Drive scan complete")
         self.progress_detail.set("100%")
         self.assistant_panel.write("SAGE", self._assistant.size_summary())
+        if result.volume.drive.upper() == "C:":
+            suggestions = self._conversation.cleanup_suggestions()
+            self.assistant_panel.write("SAGE", cleanup_report(result, suggestions))
+            self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
+            self._conversation.remember_suggestions(suggestions)
         self.status_var.set(
-            f"Ready — MFT {self._mft_elapsed:.1f}s, "
+            f"Ready â€” MFT {self._mft_elapsed:.1f}s, "
             f"sizes {time.monotonic() - self._size_started_at:.1f}s, "
             f"{len(result.records):,} records, "
             f"{result.size_errors:,} unreadable files"
@@ -359,13 +370,13 @@ class SageApplication(tk.Tk):
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate", value=0)
         self.progress_phase.set(f"{phase} failed")
-        self.progress_detail.set("—")
-        self.scan_button.configure(text="Scan MFT")
+        self.progress_detail.set("â€”")
+        self.scan_button.configure(text="Scan drive")
         self.status_var.set(f"{phase} failed.")
         self.assistant_panel.write("SAGE", f"{phase} failed:\n{exc}")
         messagebox.showerror(APP_NAME, f"{phase} failed.\n\n{exc}")
 
-    def _answer(self, question: str) -> str | None:
+    def _answer(self, question: str, quoted: str = "") -> str | None:
         conversation = self._conversation
         if self._assistant_busy:
             return "I am still answering the previous question. Please try again shortly."
@@ -373,18 +384,21 @@ class SageApplication(tk.Tk):
         self._assistant_request_id += 1
         request_id = self._assistant_request_id
         generation = self._generation
+        selected_paths = tuple(self._selected_paths())
         self.assistant_panel.begin_reply()
 
         def worker() -> None:
+            suggestions: list[CleanupSuggestion] = []
             try:
                 answer = conversation.answer(
-                    question,
+                    question, selected_paths, quoted=quoted,
                     on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                 )
+                suggestions = list(conversation.last_suggestions)
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer))
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None
@@ -395,7 +409,7 @@ class SageApplication(tk.Tk):
             return []
         paths = [
             result.path_for(frn)
-            for frn in self._action_frns
+            for frn in self.tree_panel.selected_frns()
             if frn != result.root_frn
         ]
         unique = list(dict.fromkeys(path for path in paths if path))
@@ -413,7 +427,8 @@ class SageApplication(tk.Tk):
         iid = self.tree_panel.tree.identify_row(event.y)
         if not iid:
             return
-        self._action_frns = [int(iid.split(":", 1)[1])] if iid.startswith("frn:") else []
+        if iid not in self.tree_panel.tree.selection():
+            self.tree_panel.tree.selection_set(iid)
         paths = self._selected_paths()
         selected = bool(paths) and not self._file_operation_running
         menu = self._tree_menu
@@ -421,38 +436,22 @@ class SageApplication(tk.Tk):
         menu.add_command(label="Open", command=self._open_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Show in Explorer", command=self._reveal_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Copy path", command=self._copy_path, state="normal" if selected else "disabled")
-        menu.add_command(label="Assess deletion / relocation", command=self._assess_selection,
-                         state="normal" if len(paths) == 1 and selected else "disabled")
-        menu.add_command(label="Windows Installed apps", command=lambda: self._open_settings("ms-settings:appsfeatures"))
-        menu.add_command(label="Windows Storage settings", command=lambda: self._open_settings("ms-settings:storagesense"))
         menu.add_separator()
         menu.add_command(label="Copy", command=self._copy_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Cut", command=self._cut_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Paste", command=self._paste_selection,
                          state="normal" if self._clipboard_paths and not self._file_operation_running else "disabled")
-        menu.add_command(label="Copy to…", command=self._copy_to, state="normal" if selected else "disabled")
-        menu.add_command(label="Move to…", command=self._move_to, state="normal" if selected else "disabled")
+        menu.add_command(label="Copy toâ€¦", command=self._copy_to, state="normal" if selected else "disabled")
+        menu.add_command(label="Move toâ€¦", command=self._move_to, state="normal" if selected else "disabled")
         menu.add_separator()
-        menu.add_command(label="Rename…", command=self._rename_selection,
+        menu.add_command(label="Renameâ€¦", command=self._rename_selection,
                          state="normal" if len(paths) == 1 and selected else "disabled")
-        menu.add_command(label="Send to Recycle Bin…", command=self._recycle_selection,
+        menu.add_command(label="Send to Recycle Binâ€¦", command=self._recycle_selection,
                          state="normal" if selected else "disabled")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-
-    def _open_settings(self, uri: str) -> None:
-        try:
-            os.startfile(uri)
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"Could not open Windows Settings: {exc}")
-
-    def _assess_selection(self) -> None:
-        paths = self._selected_paths()
-        if len(paths) == 1 and not self._assistant_busy:
-            self.assistant_panel.write("You", f"Assess deletion / relocation: {paths[0]}")
-            self._answer(f'Is it safe to delete or relocate "{paths[0]}"?')
 
     def _open_on_double_click(self, event: tk.Event) -> None:
         iid = self.tree_panel.tree.identify_row(event.y)
@@ -461,7 +460,7 @@ class SageApplication(tk.Tk):
             return
         record = result.records.get(int(iid.split(":", 1)[1]))
         if record and not record.is_directory:
-            self._action_frns = [record.frn]
+            self.tree_panel.tree.selection_set(iid)
             self._open_selection()
 
     def _open_selection(self) -> None:
@@ -504,7 +503,7 @@ class SageApplication(tk.Tk):
 
     def _paste_selection(self, _event: object = None) -> str:
         result = self._result
-        selected = self._action_frns
+        selected = self.tree_panel.selected_frns()
         if not self._clipboard_paths or result is None or len(selected) != 1:
             return "break"
         frn = selected[0]
@@ -548,31 +547,49 @@ class SageApplication(tk.Tk):
 
     def _recycle_selection(self, _event: object = None) -> str:
         paths = self._selected_paths()
-        if paths:
+        if paths and messagebox.askyesno(
+            "Send to Recycle Bin",
+            f"Send {len(paths)} selected item(s) to the Recycle Bin?",
+            parent=self,
+        ):
             self._run_file_operation("recycle", paths)
         return "break"
 
+    def _delete_suggestion(self, suggestion: CleanupSuggestion) -> None:
+        result = self._result
+        if result is None or self._file_operation_running:
+            return
+        if not any(s.path == suggestion.path for s in self._conversation.cleanup_suggestions()):
+            messagebox.showinfo(APP_NAME, "That item is not in the current scan's cleanup list. Scan again for fresh suggestions.")
+            return
+        size = format_bytes(suggestion.allocated)
+        if suggestion.action == "empty_recycle_bin":
+            prompt = f"Empty the Recycle Bin on {result.volume.drive} ({size})?\n\nThis cannot be undone."
+        else:
+            target = "everything inside" if suggestion.contents_only else ""
+            prompt = (
+                f"Permanently delete {target}\n{suggestion.path}\n({size})?\n\n{suggestion.reason}\n\n"
+                "This skips the Recycle Bin and cannot be undone. Files in use are skipped."
+            )
+
+        def operation() -> bool:
+            if suggestion.action == "empty_recycle_bin":
+                empty_recycle_bin(result.volume.drive)
+                return True
+            return delete_permanently(suggestion.path, suggestion.contents_only) == 0
+
+        if messagebox.askyesno("Delete permanently", prompt, icon="warning", parent=self):
+            self._run_file_operation("permanent delete", [suggestion.path], operation=operation)
+
     def _run_file_operation(
-        self, action: str, paths: list[str], destination: str | None = None
+        self,
+        action: str,
+        paths: list[str],
+        destination: str | None = None,
+        operation: Callable[[], bool] | None = None,
     ) -> None:
         if self._file_operation_running or not paths:
             return
-        if action in {"move", "rename", "recycle"}:
-            from ..platform.windows.file_operations import validate_mutation
-            try:
-                assessments = validate_mutation(paths)
-            except (OSError, ValueError) as exc:
-                messagebox.showerror(APP_NAME, str(exc))
-                return
-            preview = "\n\n".join(f"{path}\n{assessment['guidance']}" for path, assessment in zip(paths[:8], assessments[:8]))
-            if len(paths) > 8:
-                preview += f"\n\n…and {len(paths) - 8} additional items. Cancel to assess them individually."
-            if destination:
-                preview += f"\n\nDestination: {destination}"
-            if action == "recycle":
-                preview += "\n\nRecycling does not free drive space until the Recycle Bin is emptied. Windows may report that an item cannot be recycled; cancel rather than permanently deleting it."
-            if not messagebox.askyesno(APP_NAME, f"Confirm {action} of {len(paths)} item(s):\n\n{preview}", parent=self):
-                return
         if destination and action in {"copy", "move"}:
             target = os.path.normcase(os.path.abspath(destination))
             if any(
@@ -599,14 +616,14 @@ class SageApplication(tk.Tk):
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start(12)
         self.progress_phase.set(f"Windows: {action}")
-        self.progress_detail.set("Working…")
-        self.status_var.set(f"Windows is performing: {action}…")
+        self.progress_detail.set("Workingâ€¦")
+        self.status_var.set(f"Windows is performing: {action}â€¦")
         generation = self._generation
         owner_hwnd = self.winfo_id()
 
         def worker() -> None:
             try:
-                completed = shell_file_operation(action, paths, destination, owner_hwnd)
+                completed = operation() if operation else shell_file_operation(action, paths, destination, owner_hwnd)
                 self._events.put(("operation_done", generation, action, completed, requires_rescan))
             except Exception as exc:
                 self._events.put(("operation_error", generation, exc, requires_rescan))
@@ -623,7 +640,10 @@ class SageApplication(tk.Tk):
         self.progress_detail.set("Ready")
         if action == "move":
             self._clipboard_paths = []
-        outcome = "completed" if completed else "cancelled or only partly completed"
+        outcome = "completed" if completed else (
+            "finished, but some files were in use and were skipped"
+            if action == "permanent delete" else "cancelled or only partly completed"
+        )
         if requires_rescan:
             self._pending_size_completion = None
             self.assistant_panel.write("SAGE", f"File operation {outcome}: {action}. Refreshing the drive tree.")
@@ -634,7 +654,7 @@ class SageApplication(tk.Tk):
                 self._size_finished(self._pending_size_completion)
                 self._pending_size_completion = None
             elif self._result is not None and not self._result.sizes_complete:
-                self.status_var.set("Copy finished — background size analysis continues.")
+                self.status_var.set("Copy finished â€” background size analysis continues.")
 
     def _close(self) -> None:
         if self._file_operation_running:

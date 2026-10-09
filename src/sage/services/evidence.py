@@ -45,8 +45,12 @@ class EvidenceAssistant:
             f"Filesystem: {result.volume.filesystem}\n"
             f"MFT records: {len(result.records):,}\n"
             f"Items: {items:,}\nFiles: {files:,}\nFolders: {folders:,}\n\n"
-            "Size analysis is running separately so the file tree remains usable.\n"
-            "Evidence source: current native NTFS MFT scan."
+            + (
+                "File sizes were read from $MFT with the hierarchy.\n"
+                if result.sizes_complete
+                else "Size analysis is running separately so the file tree remains usable.\n"
+            )
+            + "Evidence source: current native NTFS MFT scan."
         )
 
     def size_summary(self) -> str:
@@ -59,7 +63,7 @@ class EvidenceAssistant:
             f"Unreadable files: {result.size_errors:,}\n\n"
             "Allocated folder totals are sums of contained file allocation; "
             "NTFS directory metadata overhead is not included.\n"
-            "Evidence source: current Windows file metadata over the MFT hierarchy."
+            "Evidence source: current native NTFS MFT scan."
         )
 
     def answer(self, question: str) -> str:
