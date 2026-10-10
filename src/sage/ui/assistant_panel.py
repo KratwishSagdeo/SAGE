@@ -193,7 +193,8 @@ class AssistantPanel(ttk.Frame):
         if text:
             self._quote = text[:2000]
             preview = " ".join(text.split())
-            self.quote_text.set(f"Asking about: \u201c{preview[:200]}{'\u2026' if len(preview) > 200 else ''}\u201d")
+            suffix = "\u2026" if len(preview) > 200 else ""
+            self.quote_text.set(f"Asking about: \u201c{preview[:200]}{suffix}\u201d")
             self.quote_bar.grid()
 
     def clear_quote(self) -> None:
@@ -336,7 +337,8 @@ class AssistantPanel(ttk.Frame):
         self.clear_quote()
         if quote:
             preview = " ".join(quote.split())
-            self.write("You", f"\u201c{preview[:200]}{'\u2026' if len(preview) > 200 else ''}\u201d\n{question}")
+            suffix = "\u2026" if len(preview) > 200 else ""
+            self.write("You", f"\u201c{preview[:200]}{suffix}\u201d\n{question}")
         else:
             self.write("You", question)
         try:

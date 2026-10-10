@@ -26,21 +26,28 @@ FONT_CODE = ("Consolas", 10)
 
 
 def configure_styles(style: ttk.Style) -> None:
-    style.theme_use("clam")
-    root = style.master
-    root.configure(background=BG)
-    root.option_add("*Font", FONT)
-    root.option_add("*Menu.background", SURFACE)
-    root.option_add("*Menu.foreground", TEXT)
-    root.option_add("*Menu.activeBackground", SELECTION)
-    root.option_add("*Menu.activeForeground", TEXT)
-    root.option_add("*Menu.borderWidth", 1)
-    root.option_add("*Menu.relief", "solid")
-    root.option_add("*TCombobox*Listbox.background", SURFACE)
-    root.option_add("*TCombobox*Listbox.foreground", TEXT)
-    root.option_add("*TCombobox*Listbox.selectBackground", SELECTION)
-    root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
-    root.option_add("*TCombobox*Listbox.font", FONT)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    root = getattr(style, "master", None) or getattr(style, "_master", None)
+    if root is not None:
+        try:
+            root.configure(background=BG)
+            root.option_add("*Font", FONT)
+            root.option_add("*Menu.background", SURFACE)
+            root.option_add("*Menu.foreground", TEXT)
+            root.option_add("*Menu.activeBackground", SELECTION)
+            root.option_add("*Menu.activeForeground", TEXT)
+            root.option_add("*Menu.borderWidth", 1)
+            root.option_add("*Menu.relief", "solid")
+            root.option_add("*TCombobox*Listbox.background", SURFACE)
+            root.option_add("*TCombobox*Listbox.foreground", TEXT)
+            root.option_add("*TCombobox*Listbox.selectBackground", SELECTION)
+            root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+            root.option_add("*TCombobox*Listbox.font", FONT)
+        except Exception:
+            pass
 
     style.configure(
         ".", background=BG, foreground=TEXT, font=FONT, bordercolor=BORDER,
@@ -109,6 +116,10 @@ def configure_styles(style: ttk.Style) -> None:
                     font=("Segoe UI Semibold", 9), relief="flat", padding=(8, 5),
                     bordercolor=BORDER, lightcolor="#FAFAFA", darkcolor=BORDER)
     style.map("Treeview.Heading", background=[("active", "#F0F0F0")])
+    style.layout("Navigation.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+    style.configure("Navigation.Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=TEXT,
+                    rowheight=26, font=FONT, borderwidth=0)
+    style.map("Navigation.Treeview", background=[("selected", SURFACE)], foreground=[("selected", TEXT)])
 
     for orient in ("Vertical", "Horizontal"):
         style.configure(f"{orient}.TScrollbar", background="#D4D4D4", troughcolor=SURFACE,
