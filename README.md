@@ -53,6 +53,12 @@ the model together with the verified list, and it is instructed to cite full
 paths and sizes instead of generic advice. Asking about a verified item, even
 one under `C:\Windows`, shows its delete button under the reply.
 
+When a drive or a named folder has no rule-matched item, SAGE answers locally
+with the largest files and recognized caches there as review candidates (no
+delete buttons), or with the folder's largest items and the right removal route
+(for example, uninstalling apps through Installed apps), and says plainly that
+finding no candidate does not mean nothing can be removed.
+
 SAGE marks Windows and application locations as protected for cleanup advice,
 except the specific caches in the verified cleanup list. Unknown paths are
 review candidates, not confirmed safe deletions. Every deletion requires the
@@ -72,8 +78,8 @@ execution can still take time.
 
 Greetings, count/total-size questions, and drive-wide cleanup questions answer
 immediately from local logic. A cleanup question that names a folder or path
-(for example "what can I delete in Program Files (x86)?") is answered by the
-model for that folder instead of repeating the drive-wide list.
+(for example "what can I delete in Program Files (x86)?") is scoped to that
+folder instead of repeating the drive-wide list.
 
 Every model request includes a compact summary of the whole scanned drive:
 used space, top-level folders by size, the largest files, and the biggest
@@ -91,6 +97,33 @@ then send only relevant evidence and recent conversation to one model request. A
 work. Duplicate names are supplied as multiple paths for clarification.
 Retrieval uses the existing in-memory scan, not another MFT pass or file reads.
 The model receives no file-operation tools or file contents.
+
+### In-depth item analysis
+
+When a question is about one file or folder ("should I delete this?"), SAGE
+builds a profile of that item and gives it to the model, so the answer cites
+facts instead of generic advice:
+
+- From the scan: size, last-modified date, attributes (hidden, system, link,
+  cloud/online-only), file and folder counts, which file types fill it, and how
+  much of it has not changed for 30 days or a year.
+- From Windows, read on demand for that item only: the installed app that owns
+  it (publisher, version, install date from the uninstall registry), the
+  version information of its main program, its creation date, and where a
+  downloaded file came from (its `Zone.Identifier`).
+- From a built-in knowledge list of about 60 well-known locations (Steam
+  libraries and caches, browser profiles, WinSxS, Windows.old, `node_modules`,
+  WSL and Docker disks, and so on): what the location is and the supported way
+  to remove or shrink it.
+
+When several items share a name, for example "should I delete steam?", SAGE
+lists each match with its size and role (for example "1.5 GB, part of Steam"
+or "30.0 MB, Steam's built-in web browser cache") and asks which one you mean.
+Protected items get a local reply built from the same profile: who owns the
+item, what fills it, how stale it is, and the supported removal route.
+
+No database is used; profiles are built from the in-memory scan and cached
+until the next scan.
 
 Replies stream into the assistant pane as text arrives. Basic Markdown bold,
 italics, headings, bullets, and inline code render with Tk text styles. A spinner
@@ -152,8 +185,10 @@ python -m unittest discover -s tests -v
 ## Architecture
 
 - `platform/windows/mft.py` reads `$MFT` from the raw volume, applies the
-  NTFS update-sequence fixup, and parses FILE records for names, parents, and
-  unnamed `$DATA` sizes.
+  NTFS update-sequence fixup, and parses FILE records for names, parents,
+  unnamed `$DATA` sizes, modified time, and attributes. Only junctions and
+  symlinks keep the link attribute; OneDrive placeholders and compressed files
+  do not.
 - `platform/windows/file_operations.py` handles Windows Shell copy/move/rename
   and Recycle Bin actions, plus permanent delete and emptying the Recycle Bin
   from chat cleanup buttons.
@@ -165,6 +200,10 @@ python -m unittest discover -s tests -v
   safe-to-delete list from the finished scan.
 - `services/evidence.py` produces deterministic fallback answers.
 - `services/retrieval.py` retrieves bounded scan evidence and cleanup-risk labels.
+- `services/profile.py` builds the per-item profile: scan metadata, owning
+  installed app, program version information, and download source.
+- `services/known_folders.py` is the knowledge list of well-known Windows
+  locations and their supported cleanup routes.
 - `services/local_ai.py` handles fast replies, cleanup-intent answers, relevant
   evidence, bounded history, and streaming from the local model.
 - `ui/assistant_panel.py` renders chat replies and embeds a delete button per

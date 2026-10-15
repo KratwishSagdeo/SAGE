@@ -28,8 +28,14 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 USN_RECORD_V2_HEADER_SIZE = 60
 NTFS_RECORD_NUMBER_MASK = (1 << 48) - 1
 MFT_USA_STRIDE = 512
+ATTR_STANDARD_INFORMATION = 0x10
 ATTR_FILE_NAME = 0x30
 ATTR_DATA = 0x80
+ATTR_REPARSE_POINT = 0xC0
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+# Junctions and symlinks set this tag bit; OneDrive, WOF-compressed and dedup files do not.
+REPARSE_TAG_NAME_SURROGATE = 0x20000000
+FILETIME_UNIX_EPOCH = 116444736000000000
 ATTR_END = 0xFFFFFFFF
 MFT_IN_USE = 0x0001
 MFT_IS_DIRECTORY = 0x0002
@@ -115,8 +121,11 @@ def parse_data_runs(data: bytes) -> list[tuple[int, int]]:
 
 def parse_mft_file_record(
     record: bytes | bytearray | memoryview,
-) -> tuple[int, int, bool, str, int, int, int] | None:
-    """Return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated)."""
+) -> tuple[int, int, bool, str, int, int, int, int, int] | None:
+    """Return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes).
+
+    modified is Unix seconds from $STANDARD_INFORMATION; attributes are its Windows file attributes.
+    """
     if len(record) < 0x30 or record[0:4] != b"FILE":
         return None
     flags = struct.unpack_from("<H", record, 0x16)[0]
@@ -133,6 +142,9 @@ def parse_mft_file_record(
     name_rank = -1
     logical = 0
     allocated = 0
+    modified = 0
+    attributes = 0
+    reparse_tag = None
     offset = first_attr
     while offset + 16 <= limit:
         attr_type = struct.unpack_from("<I", record, offset)[0]
@@ -143,7 +155,16 @@ def parse_mft_file_record(
             break
         non_resident = record[offset + 8]
         name_len = record[offset + 9]
-        if attr_type == ATTR_FILE_NAME and not non_resident:
+        if attr_type in (ATTR_STANDARD_INFORMATION, ATTR_REPARSE_POINT) and not non_resident:
+            value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
+            value_start = offset + struct.unpack_from("<H", record, offset + 0x14)[0]
+            if attr_type == ATTR_STANDARD_INFORMATION and value_len >= 0x24 and value_start + 0x24 <= limit:
+                filetime = struct.unpack_from("<Q", record, value_start + 8)[0]
+                modified = max(0, (filetime - FILETIME_UNIX_EPOCH) // 10_000_000)
+                attributes = struct.unpack_from("<I", record, value_start + 0x20)[0]
+            elif attr_type == ATTR_REPARSE_POINT and value_len >= 4 and value_start + 4 <= limit:
+                reparse_tag = struct.unpack_from("<I", record, value_start)[0]
+        elif attr_type == ATTR_FILE_NAME and not non_resident:
             parsed = _file_name_attr(record, offset)
             if parsed is not None:
                 candidate, parent, rank = parsed
@@ -154,7 +175,9 @@ def parse_mft_file_record(
             if sizes is not None:
                 logical, allocated = sizes
         offset += attr_len
-    return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated)
+    if reparse_tag is not None and not reparse_tag & REPARSE_TAG_NAME_SURROGATE:
+        attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT
+    return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes)
 
 
 def _file_name_attr(record: bytes | bytearray | memoryview, offset: int) -> tuple[str, int, int] | None:
@@ -378,6 +401,8 @@ def enumerate_mft(
             progress_details(0, 0.0)
 
         pending = bytearray()
+        # A few hundred distinct attribute values cover millions of records; share one int each.
+        attribute_values: dict[int, int] = {}
         record_index = 0
         bytes_seen = 0
 
@@ -392,7 +417,7 @@ def enumerate_mft(
                             memoryview(pending)[rec_off : rec_off + record_size]
                         )
                         if parsed is not None:
-                            base_ref, sequence, is_directory, name, parent_frn, logical, allocated = parsed
+                            base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, file_attributes = parsed
                             frn = (record_index & NTFS_RECORD_NUMBER_MASK) | (sequence << 48)
                             if base_ref:
                                 if logical or allocated:
@@ -402,14 +427,16 @@ def enumerate_mft(
                                     )
                                 skipped += 1
                             elif name:
+                                file_attributes |= FILE_ATTRIBUTE_DIRECTORY if is_directory else 0
                                 records[frn] = FileRecord(
                                     frn,
                                     parent_frn,
                                     name,
-                                    FILE_ATTRIBUTE_DIRECTORY if is_directory else 0,
+                                    attribute_values.setdefault(file_attributes, file_attributes),
                                     logical_size=logical,
                                     allocated_size=allocated,
                                     size_ready=True,
+                                    modified=modified,
                                 )
                             else:
                                 skipped += 1

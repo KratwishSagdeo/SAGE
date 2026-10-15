@@ -98,19 +98,22 @@ class ScopedQuestionTests(unittest.TestCase):
     def test_named_folder_question_is_scoped_not_the_drive_wide_list(self):
         assistant, payloads = self._assistant()
         answer = assistant.answer("what can i delete in program files (x86)?")
+        self.assertEqual(payloads, [])
         self.assertNotIn("You can free about", answer)
-        context = self._context(payloads[0])
-        self.assertEqual([item["path"] for item in context["matched_items"]], ["C:\\Program Files (x86)"])
-        contents = context["contents_by_size"]["C:\\Program Files (x86)"]
-        self.assertTrue(contents[0].startswith("C:\\Program Files (x86)\\Steam"))
-        self.assertIn("top_level_by_size", context["drive_summary"])
+        self.assertIn("C:\\Program Files (x86)", answer)
+        self.assertIn("Decision: do not delete", answer)
+        self.assertIn("Steam", answer)
+        self.assertNotIn("Name a child folder", answer)
 
     def test_different_folders_get_different_evidence(self):
         assistant, payloads = self._assistant()
-        assistant.answer("what is inside Downloads?")
-        assistant.answer("what is inside Documents?")
-        first, second = (self._context(p)["matched_items"][0]["path"] for p in payloads)
-        self.assertEqual((first, second), ("C:\\Users\\hp\\Downloads", "C:\\Users\\hp\\Documents"))
+        downloads = assistant.answer("what is inside Downloads?")
+        documents = assistant.answer("what is inside Documents?")
+        self.assertEqual(payloads, [])
+        self.assertIn("C:\\Users\\hp\\Downloads", downloads)
+        self.assertNotIn("Documents", downloads)
+        self.assertIn("C:\\Users\\hp\\Documents", documents)
+        self.assertNotIn("Downloads", documents)
 
     def test_selected_text_is_resolved_and_sent(self):
         assistant, payloads = self._assistant()

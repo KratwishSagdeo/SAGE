@@ -19,7 +19,7 @@ def _name_key(name: str) -> str:
 
 
 def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
-    """Classify cleanup risk conservatively; never claim a path is safe to delete."""
+    """Describe consequences, not a guarantee that a filename is disposable."""
     normalized = ntpath.normcase(ntpath.normpath(path.removeprefix("\\\\?\\")))
     drive, tail = ntpath.splitdrive(normalized)
     system = ntpath.normcase((system_drive or os.environ.get("SystemDrive") or "C:").rstrip("\\/"))
@@ -33,6 +33,8 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
         return {"risk": "protected", "guidance": "This is repository metadata. Deleting it can lose local history, branches and uncommitted repository state; moving it alone can break the repository. Keep it with its project."}
     if first == "users" and len(parts) <= 2:
         return {"risk": "protected", "guidance": "This is a user-profile container. Do not delete or move the whole container; inspect its individual documents, downloads and application data instead."}
+    if first == "documents and settings":
+        return {"risk": "protected", "guidance": "This is a compatibility link to your user profiles, not your Documents folder. Do not delete or move it. Your documents are under Users."}
     if first in {"program files", "program files (x86)", "programdata", "system volume information", "recovery"}:
         action = "Use Windows Installed apps to uninstall an application you no longer use." if first.startswith("program files") else "Use Windows Storage cleanup or the relevant application settings."
         return {"risk": "protected", "guidance": f"Do not directly delete or move this system/application location. {action}"}
@@ -72,6 +74,7 @@ class ScanEvidence:
         "overview", "show", "size", "space", "storage", "tell", "use", "used", "uses", "using", "taking",
         "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its", "itself", "safe", "free", "clear",
         "clean", "cleanup", "junk", "inside", "not", "avoid", "never", "shouldn", "t", "explain", "really", "so", "needed", "necessary", "sensitive", "private", "contains", "contain", "why", "where", "there", "here", "c", "d",
+        "am", "was", "were", "being", "good", "guy", "gay", "looking", "hot", "sexy", "idiot", "we", "they", "who", "was",
     })
 
     def _folder_index(self) -> dict[str, list[int]]:
@@ -81,6 +84,31 @@ class ScanEvidence:
                 if record.is_directory and record.frn != self.result.root_frn:
                     self._folders.setdefault(_name_key(record.name), []).append(record.frn)
         return self._folders
+
+    def _compact_folder_index(self) -> dict[str, list[int]]:
+        """'program data' and 'ProgramData' share one key."""
+        cached = getattr(self, "_compact_folders", None)
+        if cached is None:
+            cached = {}
+            for key, frns in self._folder_index().items():
+                cached.setdefault(key.replace(" ", ""), []).extend(frns)
+            self._compact_folders = cached
+        return cached
+
+    def loose_folders(self, name: str, scope: str | None = None, limit: int = 6) -> list[dict]:
+        """Folders whose name matches once spaces and punctuation are ignored."""
+        compact = "".join(_WORD.findall(name.casefold()))
+        if len(compact) < 2:
+            return []
+        found = []
+        for frn in self._compact_folder_index().get(compact, ()):
+            path = self.result.path_for(frn)
+            if path and frn not in found and (scope is None or self.within(path, scope)):
+                if len(compact) == 2 and path.count("\\") > 2:
+                    continue
+                found.append(frn)
+        found.sort(key=lambda frn: (self.result.path_for(frn) or "").count("\\"))
+        return [self._entry(self.result.records[frn]) for frn in found[:limit]]
 
     def named_folders(self, question: str, limit: int = 6) -> list[int]:
         """Folders named exactly in the question; longest names win over their sub-phrases."""
@@ -116,7 +144,11 @@ class ScanEvidence:
         found = self.named_folders(question, limit)
         exact_match = bool(found)
         ignored = self._IGNORED
-        terms = list(dict.fromkeys(quoted + [word.rstrip(".") for word in words if word not in ignored and len(word.rstrip(".")) >= 2]))[:4]
+        short_ok = {"hp", "git"}
+        terms = list(dict.fromkeys(quoted + [
+            word.rstrip(".") for word in words
+            if word not in ignored and (len(word.rstrip(".")) >= 3 or word.rstrip(".") in short_ok)
+        ]))[:4]
         if not found and terms:
             exact: list[int] = []
             partial: list[int] = []
@@ -138,12 +170,12 @@ class ScanEvidence:
         return record.allocated_size
 
     def largest_children(self, frn: int, limit: int = 8) -> list[str]:
-        """'path — size' lines for a folder's biggest direct children."""
+        """'path - size' lines for a folder's biggest direct children."""
         result = self.result
         children = [result.records[c] for c in result.children.get(frn, ()) if c in result.records]
         biggest = heapq.nlargest(limit, children, key=self._allocated)
         return [
-            f"{result.path_for(child.frn)} ({'folder' if child.is_directory else 'file'}) — {format_bytes(self._allocated(child))}"
+            f"{result.path_for(child.frn)} ({'folder' if child.is_directory else 'file'}) - {format_bytes(self._allocated(child))}"
             for child in biggest
         ]
 
@@ -162,7 +194,7 @@ class ScanEvidence:
             }
             if result.sizes_complete:
                 summary["largest_files"] = [
-                    f"{entry['path']} — {entry['allocated_display']}"
+                    f"{entry['path']} - {entry['allocated_display']}"
                     for entry in self.largest("files", 10)["items"]
                 ]
                 deep = heapq.nlargest(
@@ -174,7 +206,7 @@ class ScanEvidence:
                     other is not r and self._is_ancestor(r.frn, other.frn) for other in deep
                 )]
                 summary["biggest_leaf_folders"] = [
-                    f"{result.path_for(r.frn)} — {format_bytes(self._allocated(r))}" for r in leaves[:10]
+                    f"{result.path_for(r.frn)} - {format_bytes(self._allocated(r))}" for r in leaves[:10]
                 ]
             self._summary = summary
         return self._summary
@@ -337,7 +369,7 @@ class ScanEvidence:
                 frn, current_path = pending.pop()
                 record = self.result.records[frn]
                 risk = assess_path(current_path)["risk"]
-                if record.attributes & (0x400 | 0x4):
+                if record.attributes & 0x400 or (record.attributes & 0x4 and not record.is_directory):
                     continue
                 if frn != parent["frn"] and risk in {"managed_cleanup", "review"}:
                     if not record.is_directory or risk == "managed_cleanup":

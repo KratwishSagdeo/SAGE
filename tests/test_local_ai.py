@@ -115,6 +115,9 @@ class ConversationTests(unittest.TestCase):
         answer = assistant.answer("Can I delete C:\\Program Files (x86)?")
         self.assertIn("Do not directly delete", answer)
         self.assertIn("Installed apps", answer)
+        self.assertIn("do not delete program files", answer.casefold())
+        self.assertNotIn("cannot verify", answer)
+        self.assertNotIn("Game libraries", answer)
 
     def test_grounding_uses_one_model_call_and_preserves_followup_context(self):
         calls = []
@@ -125,15 +128,13 @@ class ConversationTests(unittest.TestCase):
 
         assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=fake_transport))
         answer = assistant.answer("How large is archive.zip?")
-        self.assertIn("104 bytes", answer)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["keep_alive"], "10m")
-        self.assertNotIn("tools", calls[0])
-        self.assertTrue(calls[0]["stream"])
-        self.assertIn("archive.zip", calls[0]["messages"][-1]["content"])
-        assistant.answer("What about it?")
-        self.assertIn("How large is archive.zip?", str(calls[1]["messages"]))
-        self.assertIn("previous_items", calls[1]["messages"][-1]["content"])
+        self.assertIn("104 B", answer)
+        self.assertIn("archive.zip", answer)
+        self.assertEqual(calls, [])
+        reply = assistant.answer("What about it?")
+        self.assertIn("archive.zip", reply)
+        self.assertNotIn("Program Files", reply)
+        self.assertEqual(calls, [])
 
     def test_named_git_assessment_never_needs_model_and_followup_uses_target(self):
         result = sample_scan()
@@ -156,7 +157,7 @@ class ConversationTests(unittest.TestCase):
         result = sample_scan()
         result.records[30] = FileRecord(30, 5, "HP", FILE_ATTRIBUTE_DIRECTORY)
         result.records[31] = FileRecord(31, 10, "HP", FILE_ATTRIBUTE_DIRECTORY)
-        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Clarification must be local")))
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("The choice is answered from the scan")))
         reply = assistant.answer("Shoild I delete this HP")
         self.assertIn("Which item", reply)
         self.assertIsNone(assistant._confirmed_path)
@@ -171,12 +172,107 @@ class ConversationTests(unittest.TestCase):
         self.assertIn("archive.zip", reply)
         self.assertNotIn("Do not directly delete", reply)
         reply = assistant.answer("Should I delete archive.zip?", ("C:\\Program Files (x86)",))
-        self.assertIn("archive.zip", reply)
-        self.assertNotIn("Program Files", reply)
+        self.assertIn("no folder named `archive.zip` in `C:\\Program Files (x86)`", reply)
+        self.assertIn("C:\\Users\\Ada\\Downloads\\archive.zip", reply)
+        chosen = assistant.answer("1")
+        self.assertIn("archive.zip", chosen)
+        self.assertNotIn("Do not directly delete", chosen)
 
-    def test_here_without_confirmed_scope_asks_even_with_tree_selection(self):
-        assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Clarification must be local")))
-        self.assertIn("Which file, folder or drive", assistant.answer("What should I delelet here?", ("C:\\Users",)))
+    def test_clicked_folder_is_the_subject_without_typing_its_path(self):
+        assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("A clicked folder is answered from the scan")))
+        reply = assistant.answer("What is this?", ("C:\\Users",))
+        self.assertIn("C:\\Users", reply)
+        self.assertIn("Ada", reply)
+        self.assertIn("not permission to delete", reply)
+        self.assertEqual(assistant._confirmed_path, "C:\\Users")
+
+    def test_off_topic_question_does_not_explain_the_selected_folder(self):
+        assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Off-topic chat is local")))
+        reply = assistant.answer("am i sexy?", ("C:\\Users",))
+        self.assertIn("not a question about this drive", reply.casefold())
+        self.assertNotIn("C:\\Users", reply)
+        self.assertNotIn("node_modules", reply)
+        self.assertNotIn("System Volume Information", reply)
+        missing = assistant.answer("what is the weather", ("C:\\Users",))
+        self.assertIn("not a question about this drive", missing.casefold())
+        self.assertNotIn("C:\\Users", missing)
+
+    def test_chat_never_searches_locale_folders_or_people_names(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 22, "am", FILE_ATTRIBUTE_DIRECTORY)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Chat must not search the scan")))
+        for question in (
+            "Am i looking hot",
+            "are you idiot",
+            "was osama bin laden a good guy",
+            "is arayn iyer good guy?",
+            "is being gay good?",
+            "am i a good guy",
+            "am i sexy",
+        ):
+            reply = assistant.answer(question, ("C:\\Users",))
+            self.assertIn("not a question about this drive", reply.casefold(), question)
+            self.assertNotIn("Which item", reply, question)
+            self.assertNotIn("full path", reply.casefold(), question)
+            self.assertNotIn("\\am", reply, question)
+            self.assertNotIn("C:\\Users", reply, question)
+
+    def test_name_missing_from_selected_folder_offers_matches_on_the_drive(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "ProgramData", FILE_ATTRIBUTE_DIRECTORY)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("The choice is answered locally")))
+        reply = assistant.answer("Can I delete program data?", ("C:\\Program Files (x86)",))
+        self.assertIn("no folder named `program data` in `C:\\Program Files (x86)`", reply)
+        self.assertIn("Are you talking about one of these?", reply)
+        self.assertIn("C:\\ProgramData", reply)
+        self.assertNotIn("could not find an exact match", reply)
+        chosen = assistant.answer("1")
+        self.assertIn("C:\\ProgramData", chosen)
+        self.assertIn("Do not directly delete", chosen)
+        self.assertIn("What to do instead", chosen)
+        self.assertIn("ms-settings:appsfeatures", {link["target"] for link in assistant.last_links})
+
+    def test_yes_accepts_the_only_offered_match_and_ignores_the_clicked_folder(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "ProgramData", FILE_ATTRIBUTE_DIRECTORY)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Confirmation stays local")))
+        assistant.answer("Can I delete program data?", ("C:\\Program Files (x86)",))
+        chosen = assistant.answer("yess", ("C:\\Recovery",))
+        self.assertIn("C:\\ProgramData", chosen)
+        self.assertNotIn("Recovery", chosen)
+
+    def test_docs_means_the_real_documents_folder(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "Documents and Settings", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[41] = FileRecord(41, 21, "Documents", FILE_ATTRIBUTE_DIRECTORY)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Documents answer stays local")))
+        reply = assistant.answer("Should I delete this docs?")
+        self.assertIn("C:\\Users\\Ada\\Documents", reply)
+        self.assertNotIn("Documents and Settings", reply)
+        self.assertIn("You can move it to", reply)
+
+    def test_folder_with_nothing_to_remove_says_so(self):
+        assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Explanation stays local")))
+        reply = assistant.answer("What is this?", ("C:\\Program Files (x86)",))
+        self.assertIn("**Decision**", reply)
+        self.assertIn("Decision: do not delete", reply)
+        self.assertNotIn("verified delete list", reply)
+        self.assertEqual(assistant.last_links[0]["label"], "Open Installed apps")
+
+    def test_here_with_a_clicked_folder_assesses_that_folder(self):
+        assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Cleanup must be local")))
+        reply = assistant.answer("What should I delelet here?", ("C:\\Users",))
+        self.assertIn("C:\\Users", reply)
+        self.assertIn("archive.zip", reply)
+        self.assertNotIn("Which file, folder or drive", reply)
 
     def test_scope_answer_continues_original_cleanup_request(self):
         assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Cleanup must be local")))
@@ -192,19 +288,21 @@ class ConversationTests(unittest.TestCase):
         result.records[31] = FileRecord(31, 10, "HP", FILE_ATTRIBUTE_DIRECTORY)
         payloads = []
         assistant = ConversationAssistant(result, OllamaClient(transport=lambda payload: payloads.append(payload) or {"message": {"content": "Size is pending."}}))
-        assistant.answer("Should I delete HP?")
-        assistant.answer("How large is C:\\HP?")
-        self.assertEqual(len(payloads), 1)
-        self.assertIn("How large is", payloads[0]["messages"][-1]["content"])
+        self.assertIn("Which item", assistant.answer("Should I delete HP?"))
+        reply = assistant.answer("How large is C:\\HP?")
+        self.assertIn("C:\\HP", reply)
+        self.assertIn("allocated", reply)
+        self.assertNotIn("Which item", reply)
+        self.assertEqual(payloads, [])
 
     def test_path_followed_by_question_does_not_consume_question(self):
         payloads = []
         assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda payload: payloads.append(payload) or {"message": {"content": "Observed children only."}}))
-        assistant.answer("C:\\Users What does this consist of?")
-        context = json.loads(payloads[0]["messages"][-1]["content"].split("(JSON): ")[1])
-        self.assertEqual(context["scope"], "C:\\Users")
-        self.assertIn("Ada", str(context["direct_children"]))
-        self.assertFalse(context["contents_read"])
+        reply = assistant.answer("C:\\Users What does this consist of?")
+        self.assertEqual(payloads, [])
+        self.assertIn("C:\\Users", reply)
+        self.assertIn("Ada", reply)
+        self.assertIn("not permission to delete", reply)
 
     def test_missing_explicit_path_never_falls_back_to_selected_or_old_item(self):
         assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Clarification must be local")))
@@ -240,15 +338,18 @@ class ConversationTests(unittest.TestCase):
     def test_empty_candidates_do_not_claim_entire_drive_has_no_safe_items(self):
         assistant = ConversationAssistant(sample_scan(), OllamaClient(transport=lambda _: self.fail("Cleanup must be local")))
         reply = assistant.answer("What should I delete in C:\\Program Files (x86)?")
-        self.assertIn("not identified a candidate", reply)
-        self.assertIn("does not mean nothing", reply)
+        self.assertIn("Decision: do not delete", reply)
+        self.assertIn("C:\\Program Files (x86)", reply)
         self.assertNotIn("no safe items", reply)
+        self.assertNotIn("Name a child folder", reply)
 
     def test_pip_cache_and_logs_get_distinct_evidence_limits(self):
         self.assertEqual(assess_path("C:\\Users\\Ada\\AppData\\Local\\pip\\cache")["risk"], "managed_cleanup")
         self.assertEqual(assess_path("C:\\Users\\Ada\\AppData\\Local\\Programs\\IDE")["risk"], "protected")
         self.assertIn("contents have not been read", assess_path("C:\\HP\\DATA\\HPOMEN.log")["guidance"])
         self.assertEqual(assess_path("C:\\Users")["risk"], "protected")
+        self.assertEqual(assess_path("C:\\Documents and Settings")["risk"], "protected")
+        self.assertIn("compatibility link", assess_path("C:\\Documents and Settings")["guidance"])
 
     def test_cleanup_scope_ranks_files_without_overlap_and_never_follows_links(self):
         result = sample_scan()
@@ -266,6 +367,123 @@ class ConversationTests(unittest.TestCase):
         assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Assessment must be local")))
         self.assertIn("what is this.txt", assistant.answer('Can I delete "C:\\Users\\Ada\\Downloads\\what is this.txt"?'))
         self.assertEqual(assistant._confirmed_path, "C:\\Users\\Ada\\Downloads\\what is this.txt")
+
+    def test_project_on_d_is_decided_by_the_model_from_rebuildable_caches(self):
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
+            10: FileRecord(10, 5, "bidding", FILE_ATTRIBUTE_DIRECTORY),
+            11: FileRecord(11, 10, "Bidding_App", FILE_ATTRIBUTE_DIRECTORY),
+            12: FileRecord(12, 11, "node_modules", FILE_ATTRIBUTE_DIRECTORY),
+            13: FileRecord(13, 11, "package.json", 0, logical_size=100, allocated_size=4096, size_ready=True),
+        }
+        result = build_scan_result(VolumeInfo("D:", "Data", "NTFS"), records)
+        calculate_directory_sizes(result)
+        result.sizes_complete = True
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Drive cleanup is answered from the scan")))
+        reply = assistant.answer("Which files are safe to delete on the entire D drive?")
+        self.assertNotIn("only for C:", reply)
+        self.assertNotIn("did not return a text answer", reply)
+        self.assertIn("node_modules", reply)
+        self.assertIn("npm install", reply)
+        self.assertTrue(assistant.last_suggestions)
+        self.assertIn("node_modules", assistant.last_suggestions[0].path)
+
+    def test_plain_drive_phrases_mean_the_scanned_drive(self):
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
+            10: FileRecord(10, 5, "bidding", FILE_ATTRIBUTE_DIRECTORY),
+            11: FileRecord(11, 10, "node_modules", FILE_ATTRIBUTE_DIRECTORY),
+            12: FileRecord(12, 10, "package.json", 0, 100, 4096, size_ready=True),
+        }
+        result = build_scan_result(VolumeInfo("D:", "Data", "NTFS"), records)
+        calculate_directory_sizes(result)
+        result.sizes_complete = True
+        questions = (
+            "what should i delete here?",
+            "what should i delete in the entire D drive",
+            "what can i delete in this drive",
+            "D",
+        )
+        for question in questions:
+            assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Drive phrases are answered from the scan")))
+            reply = assistant.answer(question)
+            self.assertIn("node_modules", reply, question)
+            self.assertNotIn("could not find", reply.casefold(), question)
+            self.assertNotIn("Which file, folder or drive", reply, question)
+
+    def test_vendor_folder_on_c_must_not_be_moved(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "hp", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[41] = FileRecord(41, 40, "HPQWare", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[42] = FileRecord(42, 41, "setup.exe", 0, 1_000_000, 1_000_000, size_ready=True)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Move answers stay on the scan")))
+        reply = assistant.answer("is it safe to move hp folder to somewhere else?")
+        self.assertIn("C:\\hp", reply)
+        self.assertIn("Do not move", reply)
+        self.assertNotIn("Safe to delete", reply)
+        self.assertNotIn("node_modules", reply)
+        self.assertNotIn("Leave these in place", reply)
+
+    def test_move_some_folder_into_users_asks_which_source(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "hp", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[41] = FileRecord(41, 40, "setup.exe", 0, 1_000_000, 1_000_000, size_ready=True)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Move into Users stays on the scan")))
+        reply = assistant.answer("can i move some folder inside users?")
+        self.assertIn("Which folder", reply)
+        self.assertIn("into `C:\\Users`", reply)
+        self.assertNotIn("Do not move a user profile folder", reply)
+        self.assertIn("C:\\hp", reply)
+        self.assertIn("1. ", reply)
+        chosen = assistant.answer("1")
+        self.assertNotIn("Which folder", chosen)
+        self.assertIn("C:\\Users", chosen)
+        self.assertNotIn("Do not move a user profile folder", chosen)
+        self.assertTrue("does not break Windows" in chosen or "does not change how Windows" in chosen)
+
+    def test_programdata_children_get_their_own_move_answers(self):
+        result = sample_scan()
+        result.records[40] = FileRecord(40, 5, "ProgramData", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[41] = FileRecord(41, 40, "USOShared", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[42] = FileRecord(42, 40, "Mozilla", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[43] = FileRecord(43, 41, "log.dat", 0, 80 * 1024 * 1024, 80 * 1024 * 1024, size_ready=True)
+        result.records[44] = FileRecord(44, 42, "data.dat", 0, 50 * 1024 * 1024, 50 * 1024 * 1024, size_ready=True)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Move answers stay on the scan")))
+        shared = assistant.answer("is it safe to move C:\\ProgramData\\USOShared?")
+        self.assertIn("Windows Update", shared)
+        self.assertNotIn("Steam", shared)
+        self.assertNotIn("Epic", shared)
+        mozilla = assistant.answer("can I move C:\\ProgramData\\Mozilla somewhere else?")
+        self.assertIn("Firefox", mozilla)
+        self.assertNotIn("Windows Update Orchestrator", mozilla)
+        self.assertNotIn("Steam", mozilla)
+        inside = assistant.answer("can I move some other files in a particular folder such as Program data?")
+        self.assertIn("C:\\ProgramData", inside)
+        self.assertIn("USOShared", inside)
+        self.assertIn("Mozilla", inside)
+        self.assertIn("Windows Update", inside)
+        self.assertIn("Firefox", inside)
+        self.assertNotIn("Game libraries", inside)
+
+    def test_program_files_cleanup_does_not_reuse_the_move_speech(self):
+        result = sample_scan()
+        result.records[50] = FileRecord(50, 5, "Program Files", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[51] = FileRecord(51, 50, "Git", FILE_ATTRIBUTE_DIRECTORY)
+        result.records[52] = FileRecord(52, 51, "tmp", FILE_ATTRIBUTE_DIRECTORY)
+        result = build_scan_result(result.volume, result.records)
+        calculate_directory_sizes(result)
+        assistant = ConversationAssistant(result, OllamaClient(transport=lambda _: self.fail("Cleanup stays on the scan")))
+        reply = assistant.answer("what can i delete inside program files?")
+        self.assertIn("Installed apps", reply)
+        self.assertNotIn("Can it be moved", reply)
+        self.assertNotIn("Git\\tmp", reply)
+        self.assertNotIn("Epic", reply)
 
     def test_unavailable_model_falls_back_to_basic_evidence(self):
         def unavailable(_payload):

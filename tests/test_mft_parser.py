@@ -63,7 +63,7 @@ class MftParserTests(unittest.TestCase):
         )
         parsed = parse_mft_file_record(record)
         self.assertIsNotNone(parsed)
-        base_ref, sequence, is_directory, name, parent, logical, allocated = parsed
+        base_ref, sequence, is_directory, name, parent, logical, allocated, _modified, _attributes = parsed
         self.assertEqual(base_ref, 0)
         self.assertEqual(sequence, 1)
         self.assertFalse(is_directory)
@@ -88,6 +88,14 @@ class MftParserTests(unittest.TestCase):
         self.assertTrue(parse_mft_file_record(folder)[2])
         self.assertEqual(parse_mft_file_record(folder)[3], "Docs")
         self.assertIsNone(parse_mft_file_record(unused))
+
+    def test_reads_modified_time_attributes_and_only_keeps_link_reparse_flag(self):
+        modified = 116444736000000000 + 1_700_000_000 * 10_000_000
+        info = pack_resident_attr(0x10, struct.pack("<4QI", 0, modified, 0, 0, 0x400 | 0x2) + bytes(0x24))
+        junction = make_mft_record(info, pack_file_name("link", 5), pack_resident_attr(0xC0, struct.pack("<I", 0xA0000003)))
+        onedrive = make_mft_record(info, pack_file_name("cloud.docx", 5), pack_resident_attr(0xC0, struct.pack("<I", 0x9000001A)))
+        self.assertEqual(parse_mft_file_record(junction)[7:], (1_700_000_000, 0x402))
+        self.assertEqual(parse_mft_file_record(onedrive)[7:], (1_700_000_000, 0x2))
 
 
 def pack_resident_attr(attr_type: int, value: bytes) -> bytes:

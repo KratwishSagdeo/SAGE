@@ -82,6 +82,7 @@ class AssistantPanel(ttk.Frame):
         self.transcript.tag_configure("speaker_sage", foreground=ACCENT)
         self.transcript.tag_configure("speaker_you", foreground=TEXT_SECONDARY)
         self.transcript.tag_configure("bold", font=FONT_SEMIBOLD)
+        self.transcript.tag_configure("heading", font=FONT_SEMIBOLD, spacing1=10, spacing3=2)
         self.transcript.tag_configure("italic", font=("Segoe UI", 10, "italic"))
         self.transcript.tag_configure("code", font=FONT_CODE, background="#F5F5F5")
 
@@ -108,9 +109,14 @@ class AssistantPanel(ttk.Frame):
             side="left", padx=(0, 8)
         )
 
+        self.selected_text = tk.StringVar()
+        self.selected_label = ttk.Label(footer, textvariable=self.selected_text, style="SurfaceMuted.TLabel")
+        self.selected_label.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.selected_label.grid_remove()
+
         # Quote bar
         self.quote_bar = ttk.Frame(footer, style="Quote.TFrame", padding=(10, 5, 6, 5))
-        self.quote_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.quote_bar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.quote_bar.columnconfigure(0, weight=1)
         self.quote_text = tk.StringVar()
         ttk.Label(self.quote_bar, textvariable=self.quote_text, style="Quote.TLabel", width=1).grid(
@@ -123,7 +129,7 @@ class AssistantPanel(ttk.Frame):
 
         # Composer
         composer = ttk.Frame(footer, style="Surface.TFrame")
-        composer.grid(row=2, column=0, sticky="ew")
+        composer.grid(row=3, column=0, sticky="ew")
         composer.columnconfigure(0, weight=1)
         composer.rowconfigure(0, weight=1)
 
@@ -147,6 +153,10 @@ class AssistantPanel(ttk.Frame):
             selectforeground=TEXT,
         )
         self.question.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.question.bind("<Return>", self._submit)
+        self.question.bind("<KP_Enter>", self._submit)
+        self.question.bind("<Shift-Return>", self._newline)
+        self.question.bind("<Shift-KP_Enter>", self._newline)
         self.question.bind("<Control-Return>", self._submit)
         self.question.bind("<Button-3>", self._show_prompt_menu)
 
@@ -157,7 +167,7 @@ class AssistantPanel(ttk.Frame):
                                      command=self._submit, width=6)
         self.ask_button.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(composer, text="Ctrl+Enter to send", style="Hint.TLabel").grid(
+        ttk.Label(composer, text="Enter to send   ·   Shift+Enter for a new line", style="Hint.TLabel").grid(
             row=1, column=0, sticky="w", pady=(3, 0)
         )
 
@@ -171,8 +181,8 @@ class AssistantPanel(ttk.Frame):
 
         self.write(
             "SAGE",
-            "Hey! I\u2019m SAGE. Scan a drive and ask me about a folder by name, "
-            "what\u2019s using space, or what to consider before removing something.",
+            "Hey! I\u2019m SAGE. Click a folder in the list and ask about it, "
+            "or name a folder, and I will answer from the scan.",
         )
 
     # ── Transcript helpers ────────────────────────────────────────────
@@ -197,6 +207,14 @@ class AssistantPanel(ttk.Frame):
             self.quote_text.set(f"Asking about: \u201c{preview[:200]}{suffix}\u201d")
             self.quote_bar.grid()
 
+    def set_selected_item(self, path: str | None) -> None:
+        """Show the folder a click will use when the question does not name another one."""
+        if not path:
+            self.selected_label.grid_remove()
+            return
+        self.selected_text.set(f"Selected: {path}")
+        self.selected_label.grid()
+
     def clear_quote(self) -> None:
         self._quote = ""
         self.quote_bar.grid_remove()
@@ -217,6 +235,21 @@ class AssistantPanel(ttk.Frame):
             )
             button = ttk.Button(self.transcript, text=label, style="Danger.TButton", command=lambda item=suggestion: on_delete(item))
             self.transcript.window_create("end", window=button, pady=2)
+        self.transcript.see("end")
+        self.transcript.configure(state="disabled")
+
+    def add_open_buttons(self, links: list[dict], on_open: Callable[[str], None]) -> None:
+        """Open the Windows Settings page the reply named."""
+        if not links:
+            return
+        self.transcript.configure(state="normal")
+        self.transcript.insert("end", "\n")
+        for link in links:
+            button = ttk.Button(
+                self.transcript, text=link["label"], style="Accent.TButton",
+                command=lambda target=link["target"]: on_open(target),
+            )
+            self.transcript.window_create("end", window=button, padx=6, pady=4)
         self.transcript.see("end")
         self.transcript.configure(state="disabled")
 
@@ -327,6 +360,10 @@ class AssistantPanel(ttk.Frame):
         self.ask_button.configure(state="normal")
 
     # ── Submit ────────────────────────────────────────────────────────
+
+    def _newline(self, _event: object = None) -> str:
+        self.question.insert("insert", "\n")
+        return "break"
 
     def _submit(self, _event: object = None) -> str | None:
         question = self.question.get("1.0", "end-1c").strip()

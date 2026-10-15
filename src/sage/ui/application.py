@@ -157,6 +157,7 @@ class SageApplication(tk.Tk):
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
         self.tree_panel = TreePanel(left)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
+        self.tree_panel.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
         self.tree_panel.tree.bind("<Double-1>", self._open_on_double_click)
         self.tree_panel.tree.bind("<Control-c>", self._copy_selection)
@@ -319,6 +320,8 @@ class SageApplication(tk.Tk):
                     if len(event) > 4 and event[4]:
                         self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
                         self._conversation.remember_suggestions(event[4])
+                    if len(event) > 5 and event[5]:
+                        self.assistant_panel.add_open_buttons(event[5], self._open_settings)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -358,6 +361,7 @@ class SageApplication(tk.Tk):
             self._assistant_busy = False
         self._conversation = ConversationAssistant(result)
         self.tree_panel.show_result(result)
+        self.assistant_panel.set_selected_item(None)
         self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
@@ -421,6 +425,7 @@ class SageApplication(tk.Tk):
 
         def worker() -> None:
             suggestions: list[CleanupSuggestion] = []
+            links: list[dict] = []
             try:
                 answer = conversation.answer(
                     question, selected_paths, quoted=quoted,
@@ -428,12 +433,17 @@ class SageApplication(tk.Tk):
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                 )
                 suggestions = list(conversation.last_suggestions)
+                links = list(conversation.last_links)
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer, suggestions))
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None
+
+    def _on_tree_selected(self, _event: object = None) -> None:
+        paths = self._selected_paths()
+        self.assistant_panel.set_selected_item(paths[0] if len(paths) == 1 else None)
 
     def _selected_paths(self) -> list[str]:
         result = self._result
@@ -494,6 +504,9 @@ class SageApplication(tk.Tk):
         if record and not record.is_directory:
             self.tree_panel.tree.selection_set(iid)
             self._open_selection()
+
+    def _open_settings(self, target: str) -> None:
+        os.startfile(target)
 
     def _open_selection(self) -> None:
         paths = self._selected_paths()

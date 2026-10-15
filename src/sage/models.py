@@ -20,6 +20,7 @@ class FileRecord:
     allocated_size: int = 0
     size_error: str | None = None
     size_ready: bool = False
+    modified: int = 0  # Unix seconds from $STANDARD_INFORMATION; 0 when unknown.
 
     @property
     def is_directory(self) -> bool:

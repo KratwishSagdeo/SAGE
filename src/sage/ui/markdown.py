@@ -56,7 +56,7 @@ def markdown_spans(message: str, *, partial: bool = False) -> list[tuple[str, tu
             spans.append((line, ("code",)))
             continue
         heading = re.match(r"^\s{0,3}#{1,6}\s+", line)
-        tags = ("bold",) if heading else ()
+        tags = ("heading",) if heading else ()
         if heading:
             line = line[heading.end():]
         line = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", line)
